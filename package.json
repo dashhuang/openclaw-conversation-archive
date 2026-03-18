@@ -1,0 +1,52 @@
+{
+  "name": "@dashhuang/conversation-archive",
+  "version": "0.1.2",
+  "description": "Workspace-local conversation archive and retrieval plugin for OpenClaw",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dashhuang/openclaw-conversation-archive.git"
+  },
+  "homepage": "https://github.com/dashhuang/openclaw-conversation-archive#readme",
+  "bugs": {
+    "url": "https://github.com/dashhuang/openclaw-conversation-archive/issues"
+  },
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "conversation-archive",
+    "chat-history",
+    "history-retrieval"
+  ],
+  "files": [
+    "index.js",
+    "openclaw.plugin.json",
+    "README.md",
+    "INSTALL.md",
+    "LICENSE",
+    "skills",
+    "scripts"
+  ],
+  "exports": {
+    ".": "./index.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "openclaw-conversation-archive-search": "scripts/search_archive.py",
+    "openclaw-conversation-archive-health": "scripts/check_archive.py"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ]
+  },
+  "scripts": {
+    "test": "node --test ./tests/conversation-archive.test.mjs && python3 ./tests/test_search_archive.py"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

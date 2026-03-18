@@ -1,0 +1,20 @@
+{
+  "id": "conversation-archive",
+  "name": "Conversation Archive",
+  "description": "Archives gateway-seen messages into workspace-local JSONL logs and bundles a skill for later history retrieval.",
+  "skills": ["./skills"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "archiveRoot": {
+        "type": "string",
+        "description": "Relative archive path under each workspace. Defaults to logs/message-archive-raw."
+      },
+      "warnOnUnsupportedChannels": {
+        "type": "boolean",
+        "description": "Warn once when a channel is not yet mapped into the archive format."
+      }
+    }
+  }
+}
