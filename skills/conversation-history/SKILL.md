@@ -1,17 +1,25 @@
 ---
 name: conversation-history
-description: Use when the user asks what was said earlier in a chat, wants exact wording, prior links, chronology, or suspects memory may be incomplete. Search curated memory first, then search the raw conversation archive when precision matters.
+description: Use when the user asks what was said earlier in a chat, wants exact wording, prior links, chronology, or suspects memory may be incomplete across Telegram, BlueBubbles, Feishu, ChatGPT, Claude, or other archived chat sources. Search curated memory first, then search the raw conversation archive when precision matters.
 ---
 
 # Conversation History
 
 Use this skill when users need exact historical recall beyond curated memory.
 
+This is a general archive search skill, not just a Telegram or Feishu helper.
+
 ## Why this exists
 
 Curated memory is intentionally lossy.
 
 The conversation archive keeps raw chat history searchable without forcing every message into the live AI session context. That helps preserve token budget while still allowing later retrieval.
+
+If archive data exists in `logs/message-archive-raw/`, this skill can search it, including:
+
+- live messages captured by `conversation-archive`
+- old ChatGPT / Claude exports imported through `openclaw-chat-history-import`
+- other archive-compatible chat logs
 
 ## Workflow
 
@@ -28,7 +36,13 @@ python3 packages/conversation-archive/scripts/search_archive.py --query "keyword
 python3 packages/conversation-archive/scripts/search_archive.py --channel telegram --chat-type group --query "OpenClaw"
 python3 packages/conversation-archive/scripts/search_archive.py --channel bluebubbles --chat-type direct --sender "Cherry" --limit 5
 python3 packages/conversation-archive/scripts/search_archive.py --from-date 2026-03-01 --to-date 2026-03-14 --query "Confluence"
+python3 packages/conversation-archive/scripts/search_archive.py --channel chatgpt --query "memory export"
+python3 packages/conversation-archive/scripts/search_archive.py --channel claude --query "project plan"
+python3 packages/conversation-archive/scripts/search_archive.py --query "shareholder letter" --limit 5
 ```
+
+Use channel filters when the source is known.
+If the user mostly cares about content recall rather than source attribution, broad keyword search is often enough.
 
 ## Output Rules
 
@@ -43,3 +57,16 @@ python3 packages/conversation-archive/scripts/search_archive.py --from-date 2026
 - Archive content records what participants said, not whether they were factually correct.
 - Standard mode archive coverage depends on what reached official plugin hooks.
 - If no relevant hit exists, say that directly and mention the filters you used.
+
+## Companion Components
+
+This skill becomes much more useful when paired with archive-producing tools.
+
+- For live ongoing archive capture, pair it with:
+  - `conversation-archive`
+  - https://github.com/dashhuang/openclaw-conversation-archive
+- For importing old AI chat exports such as ChatGPT and Claude, pair it with:
+  - `openclaw-chat-history-import`
+  - https://github.com/dashhuang/openclaw-chat-history-import
+
+Without one of those archive-producing workflows, this skill can only search whatever archive files already exist locally.
