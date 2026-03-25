@@ -19,6 +19,7 @@ const {
   isBluebubblesGroupLike,
   normalizeTimestampMs,
   resolveArchiveRoot,
+  resolveWorkspaceDir,
   searchArchive,
   resolveWorkspaceForEvent,
   resolveWorkspaceMap,
@@ -128,8 +129,17 @@ test("formatLocalTimestamp keeps date and time fields aligned", () => {
 });
 
 test("resolveArchiveRoot honors plugin config overrides", () => {
-  assert.equal(resolveArchiveRoot("workspace"), path.join("workspace", "logs", "message-archive-raw"));
-  assert.equal(resolveArchiveRoot("workspace", { archiveRoot: "logs/custom-history" }), path.join("workspace", "logs", "custom-history"));
+  assert.equal(resolveWorkspaceDir("."), path.join(process.env.HOME, ".openclaw", "workspace"));
+  assert.equal(resolveWorkspaceDir("workspace-food-group"), path.join(process.env.HOME, ".openclaw", "workspace-food-group"));
+  assert.equal(resolveArchiveRoot("workspace"), path.join(process.env.HOME, ".openclaw", "workspace", "logs", "message-archive-raw"));
+  assert.equal(
+    resolveArchiveRoot("workspace", { archiveRoot: "logs/custom-history" }),
+    path.join(process.env.HOME, ".openclaw", "workspace", "logs", "custom-history"),
+  );
+  assert.equal(
+    resolveArchiveRoot("/tmp/workspace", { archiveRoot: "/tmp/archive-root" }),
+    "/tmp/archive-root",
+  );
 });
 
 test("searchArchive returns matching raw archive entries", async () => {

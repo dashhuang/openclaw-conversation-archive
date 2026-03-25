@@ -3,6 +3,7 @@ import path from "node:path";
 
 const ASSISTANT_NAME = "Assistant";
 const DEFAULT_ARCHIVE_ROOT = path.join("logs", "message-archive-raw");
+const DEFAULT_STATE_DIR = path.join(process.env.HOME || "", ".openclaw");
 const SUPPORTED_CHANNELS = new Set([
   "telegram",
   "bluebubbles",
@@ -303,9 +304,19 @@ export function resolveWorkspaceForEvent(config, workspaceMap, channelId, conver
   };
 }
 
+export function resolveWorkspaceDir(workspaceDir) {
+  const raw = String(workspaceDir || "").trim();
+  if (!raw || raw === ".") {
+    return path.join(DEFAULT_STATE_DIR, "workspace");
+  }
+  return path.isAbsolute(raw) ? raw : path.join(DEFAULT_STATE_DIR, raw);
+}
+
 export function resolveArchiveRoot(workspaceDir, pluginConfig = {}) {
   const configuredRoot = String(pluginConfig.archiveRoot || DEFAULT_ARCHIVE_ROOT).trim();
-  return path.join(workspaceDir, configuredRoot || DEFAULT_ARCHIVE_ROOT);
+  const workspaceRoot = resolveWorkspaceDir(workspaceDir);
+  const archiveRoot = configuredRoot || DEFAULT_ARCHIVE_ROOT;
+  return path.isAbsolute(archiveRoot) ? archiveRoot : path.join(workspaceRoot, archiveRoot);
 }
 
 export async function* iterArchiveEntries(archiveRoot) {
@@ -689,13 +700,19 @@ export function createConversationArchiveTools(api, ctx) {
 
 async function appendEventArchive(entry, workspaceDir, pluginConfig) {
   const localDate = entry.local_date;
-  const archiveRoot = resolveArchiveRoot(workspaceDir, pluginConfig);
-  const baseDirRaw = path.join(
-    archiveRoot,
+  const conversationParts = [
     entry.channel,
     entry.chat_type,
     entry.conversation_slug,
-  );
+  ];
+  let archiveRoot = resolveArchiveRoot(workspaceDir, pluginConfig);
+  if (!path.isAbsolute(archiveRoot)) {
+    archiveRoot = resolveArchiveRoot(entry.workspace || workspaceDir, pluginConfig);
+  }
+  if (!path.isAbsolute(archiveRoot)) {
+    archiveRoot = path.join(resolveWorkspaceDir(entry.workspace || workspaceDir), DEFAULT_ARCHIVE_ROOT);
+  }
+  const baseDirRaw = path.join(archiveRoot, ...conversationParts);
   await fs.mkdir(baseDirRaw, { recursive: true });
 
   const rawPath = path.join(baseDirRaw, `${localDate}.jsonl`);
