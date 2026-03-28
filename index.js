@@ -190,26 +190,44 @@ export function buildBindingCandidates(channelId, conversationId, metadata) {
 
 export function resolveBoundWorkspace(config, workspaceMap, channelId, conversationId, metadata) {
   const candidates = buildBindingCandidates(channelId, conversationId, metadata);
-  if (candidates.size === 0) {
-    return null;
-  }
   const bindings = config?.bindings || [];
+
+  // First pass: try peer-specific bindings (most specific match wins).
+  if (candidates.size > 0) {
+    for (const binding of bindings) {
+      if (String(binding?.match?.channel || "").toLowerCase() !== String(channelId || "").toLowerCase()) {
+        continue;
+      }
+      const peer = binding?.match?.peer || {};
+      const peerId = String(peer.id || "").trim();
+      if (!peerId) {
+        continue;
+      }
+      if (candidates.has(peerId)) {
+        const workspace = workspaceMap.get(String(binding.agentId));
+        if (workspace) {
+          return { workspace, agentId: String(binding.agentId), peerId };
+        }
+      }
+    }
+  }
+
+  // Second pass: channel-only bindings (no peer constraint).
   for (const binding of bindings) {
     if (String(binding?.match?.channel || "").toLowerCase() !== String(channelId || "").toLowerCase()) {
       continue;
     }
     const peer = binding?.match?.peer || {};
     const peerId = String(peer.id || "").trim();
-    if (!peerId) {
-      continue;
+    if (peerId) {
+      continue; // skip peer-specific bindings in this pass
     }
-    if (candidates.has(peerId)) {
-      const workspace = workspaceMap.get(String(binding.agentId));
-      if (workspace) {
-        return { workspace, agentId: String(binding.agentId), peerId };
-      }
+    const workspace = workspaceMap.get(String(binding.agentId));
+    if (workspace) {
+      return { workspace, agentId: String(binding.agentId), peerId: null };
     }
   }
+
   return null;
 }
 
