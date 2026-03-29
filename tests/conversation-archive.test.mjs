@@ -22,6 +22,7 @@ const {
   resolveArchiveRoot,
   resolveWorkspaceDir,
   searchArchive,
+  resolveBoundWorkspace,
   resolveWorkspaceForEvent,
   resolveWorkspaceMap,
 } = pluginModule;
@@ -428,4 +429,106 @@ test("createConversationArchiveTools exposes a health tool when workspaceDir exi
   assert.equal(result.details.status, "ok");
   assert.equal(result.details.mode, "standard");
   assert.equal(result.details.fileCount, 1);
+});
+
+test("resolveBoundWorkspace matches channel-only bindings (no peer)", () => {
+  const config = {
+    agents: {
+      defaults: { workspace: "workspace" },
+      list: [
+        { id: "main", workspace: "workspace" },
+        { id: "social", workspace: "workspace-social" },
+      ],
+    },
+    bindings: [
+      {
+        agentId: "social",
+        match: {
+          channel: "bluebubbles",
+        },
+      },
+      {
+        agentId: "main",
+        match: {
+          channel: "telegram",
+        },
+      },
+    ],
+  };
+
+  const workspaceMap = resolveWorkspaceMap(config);
+
+  // Channel-only binding should route BB to social workspace
+  const bbResult = resolveWorkspaceForEvent(
+    config,
+    workspaceMap,
+    "bluebubbles",
+    "chat_guid:any;+;chat240698944142298252",
+    { senderId: "+8618621185125" },
+  );
+  assert.equal(bbResult.workspace, "workspace-social");
+  assert.equal(bbResult.agentId, "social");
+
+  // Telegram should route to main
+  const tgResult = resolveWorkspaceForEvent(
+    config,
+    workspaceMap,
+    "telegram",
+    "telegram:435427284",
+    { senderId: "435427284" },
+  );
+  assert.equal(tgResult.workspace, "workspace");
+  assert.equal(tgResult.agentId, "main");
+});
+
+test("resolveBoundWorkspace prefers peer-specific over channel-only", () => {
+  const config = {
+    agents: {
+      defaults: { workspace: "workspace" },
+      list: [
+        { id: "main", workspace: "workspace" },
+        { id: "social", workspace: "workspace-social" },
+        { id: "vip", workspace: "workspace-vip" },
+      ],
+    },
+    bindings: [
+      {
+        agentId: "vip",
+        match: {
+          channel: "bluebubbles",
+          peer: { id: "+8618621185125" },
+        },
+      },
+      {
+        agentId: "social",
+        match: {
+          channel: "bluebubbles",
+        },
+      },
+    ],
+  };
+
+  const workspaceMap = resolveWorkspaceMap(config);
+
+  // Peer-specific should win over channel-only
+  const vipResult = resolveWorkspaceForEvent(
+    config,
+    workspaceMap,
+    "bluebubbles",
+    "bluebubbles:direct:+8618621185125",
+    { senderId: "+8618621185125" },
+  );
+  assert.equal(vipResult.workspace, "workspace-vip");
+  assert.equal(vipResult.agentId, "vip");
+
+  // Other BB senders fall back to channel-only binding
+  const otherResult = resolveWorkspaceForEvent(
+    config,
+    workspaceMap,
+    "bluebubbles",
+    "chat_guid:any;+;chat240698944142298252",
+    { senderId: "+8613003233705" },
+  );
+  assert.equal(otherResult.workspace, "workspace-social");
+  assert.equal(otherResult.agentId, "social");
 });
