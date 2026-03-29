@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile, mkdir } from "node:fs/promises";
-import path from "node:path";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -13,6 +13,7 @@ const pluginModule = await import(
 );
 const {
   buildBaseEntry,
+  buildSearchableText,
   createConversationArchiveTools,
   formatLocalTimestamp,
   inspectArchiveHealth,
@@ -82,25 +83,27 @@ test("buildBaseEntry prefers provider timestamps and emits a real local timestam
 });
 
 test("BlueBubbles shared chat GUIDs are classified as group chats", () => {
-  assert.equal(isBluebubblesGroupLike("group:any;+;af3277e8de854e0bbee77be71a4e0765"), true);
-  assert.equal(isBluebubblesGroupLike("bluebubbles:chat_guid:any;+;af3277e8de854e0bbee77be71a4e0765"), true);
+  assert.equal(isBluebubblesGroupLike("chat240698944142298252"), true);
+  assert.equal(isBluebubblesGroupLike("chat_guid:iMessage;+;chat240698944142298252"), true);
+  assert.equal(isBluebubblesGroupLike("Family Chat id:iMessage;+;chat240698944142298252"), true);
+  assert.equal(isBluebubblesGroupLike("+64210766404"), false);
 
   const entry = buildBaseEntry({
     channelId: "bluebubbles",
-    conversationId: "bluebubbles:chat_guid:any;+;af3277e8de854e0bbee77be71a4e0765",
-    metadata: { senderId: "sample-contact@example.com" },
-    role: "user",
-    speakerName: "group:any;+;af3277e8de854e0bbee77be71a4e0765",
-    speakerId: "sample-contact@example.com",
-    messageId: "AE8B393C-EDB7-43CF-B82B-0A5FC7E3A24C",
-    text: "AA会员号是什么",
+    conversationId: "chat240698944142298252",
+    metadata: {},
+    role: "assistant",
+    speakerName: "Assistant",
+    speakerId: null,
+    messageId: "bb-out-1",
+    text: "记住了，周日 13:20 去 AI CINEMA",
     workspaceDir: "workspace-wife",
     agentId: "wife",
-    timestampMs: 1742241511585,
+    timestampMs: 1774742400000,
   });
 
   assert.equal(entry.chat_type, "group");
-  assert.equal(entry.channel, "bluebubbles");
+  assert.equal(entry.conversation_slug, "chat240698944142298252");
 });
 
 test("BlueBubbles direct chats remain direct", () => {
@@ -126,6 +129,28 @@ test("formatLocalTimestamp keeps date and time fields aligned", () => {
   const localTimestamp = formatLocalTimestamp(date);
 
   assert.match(localTimestamp, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/);
+});
+
+test("buildSearchableText falls back to a plain media placeholder for image-only messages", async () => {
+  const text = await buildSearchableText({
+    preferredText: "[User sent media without caption]",
+    mediaType: "image/png",
+    mediaPath: "/tmp/ticket.png",
+    role: "user",
+  });
+
+  assert.equal(text, "[User sent image: ticket.png image/png]");
+});
+
+test("buildSearchableText keeps user caption for image messages", async () => {
+  const text = await buildSearchableText({
+    preferredText: "这是一张电影票",
+    mediaType: "image/png",
+    mediaPath: "/tmp/ticket.png",
+    role: "user",
+  });
+
+  assert.equal(text, "这是一张电影票");
 });
 
 test("resolveArchiveRoot honors plugin config overrides", () => {
@@ -199,6 +224,70 @@ test("searchArchive returns matching raw archive entries", async () => {
   assert.equal(results.length, 1);
   assert.equal(results[0].speaker_name, "Dash");
   assert.equal(results[0].text, "hello archive world");
+});
+
+test("searchArchive prefers enriched entries when the same message id is archived twice", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "conversation-archive-"));
+  try {
+    const archiveFile = path.join(
+      tempDir,
+      "telegram",
+      "group",
+      "telegram-100123",
+      "2026-03-29.jsonl",
+    );
+    await mkdir(path.dirname(archiveFile), { recursive: true });
+    await writeFile(
+      archiveFile,
+      [
+        JSON.stringify({
+          timestamp_utc: "2026-03-29T00:00:01.000Z",
+          timestamp_local: "2026-03-29T08:00:01+08:00",
+          local_date: "2026-03-29",
+          local_time: "08:00:01",
+          channel: "telegram",
+          chat_type: "group",
+          peer_id: "-100123",
+          conversation_label: "telegram:group:-100123",
+          conversation_slug: "telegram-100123",
+          message_id: "m-1",
+          role: "user",
+          speaker_name: "Dash",
+          source: "message-hook",
+          text: "[User sent media without caption]",
+        }),
+        JSON.stringify({
+          timestamp_utc: "2026-03-29T00:00:01.000Z",
+          timestamp_local: "2026-03-29T08:00:01+08:00",
+          local_date: "2026-03-29",
+          local_time: "08:00:01",
+          channel: "telegram",
+          chat_type: "group",
+          peer_id: "-100123",
+          conversation_label: "telegram:group:-100123",
+          conversation_slug: "telegram-100123",
+          message_id: "m-1",
+          role: "user",
+          speaker_name: "Dash",
+          source: "message-preprocessed",
+          text: "[Image OCR]\nAI CINEMA\n3-29 13:20",
+        }),
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const results = await searchArchive(tempDir, {
+      query: "AI CINEMA",
+      limit: 10,
+    });
+
+    assert.equal(results.length, 1);
+    assert.equal(results[0].source, "message-preprocessed");
+    assert.match(results[0].text, /AI CINEMA/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
 });
 
 test("createConversationArchiveTools exposes a search tool when workspaceDir exists", async () => {

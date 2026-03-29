@@ -18,8 +18,14 @@ const SUPPORTED_CHANNELS = new Set([
 ]);
 
 const NON_ALNUM_RE = /[^a-z0-9._+-]+/g;
-const BLUEBUBBLES_GROUP_GUID_RE = /(?:^|:)(?:chat_guid:)?any;\+;[0-9a-f-]{16,}$/i;
+const BLUEBUBBLES_GROUP_GUID_RE =
+  /(?:^|:)(?:chat_guid:)?(?:imessage|sms|auto);\+;[a-z0-9._-]+$/i;
+const BLUEBUBBLES_CHAT_IDENTIFIER_RE = /(?:^|:)(?:chat_identifier:)?chat[a-z0-9._-]{6,}$/i;
+const MEDIA_PLACEHOLDER_LINE_RE =
+  /^\[media attached(?:(?: \d+\/\d+)|: \d+ files)?(?:[:\]])|^<media:[^>]+>$/i;
 const warnedUnsupportedChannels = new Set();
+const recentArchiveWriteCache = new Map();
+const RECENT_ARCHIVE_WRITE_TTL_MS = 10 * 60 * 1000;
 const SEARCH_TOOL_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -115,6 +121,143 @@ function normalizeText(text) {
     .trim();
 }
 
+function normalizePathForLookup(rawPath) {
+  const trimmed = String(rawPath || "").trim();
+  if (!trimmed) {
+    return "";
+  }
+  if (trimmed.startsWith("file://")) {
+    try {
+      return new URL(trimmed).pathname;
+    } catch {
+      return trimmed;
+    }
+  }
+  return trimmed;
+}
+
+export function isLikelyPlaceholderText(text) {
+  const normalized = normalizeText(text);
+  if (!normalized) {
+    return true;
+  }
+  if (normalized === "[User sent media without caption]") {
+    return true;
+  }
+  if (/^<media:[^>]+>(?:\s*\(\d+ images?\))?$/i.test(normalized)) {
+    return true;
+  }
+  const lines = normalized.split("\n").map((line) => line.trim()).filter(Boolean);
+  if (lines.length === 0) {
+    return true;
+  }
+  return lines.every((line) => MEDIA_PLACEHOLDER_LINE_RE.test(line));
+}
+
+function buildMediaFallbackText({ mediaType, mediaPath, role }) {
+  const normalizedType = String(mediaType || "").trim().toLowerCase();
+  const normalizedPath = normalizePathForLookup(mediaPath);
+  const fileHint = normalizedPath ? path.basename(normalizedPath) : "";
+  const roleLabel = role === "assistant" ? "Assistant" : "User";
+  const kind = normalizedType.startsWith("image/")
+    ? "image"
+    : normalizedType.startsWith("audio/")
+      ? "audio"
+      : normalizedType.startsWith("video/")
+        ? "video"
+        : "media";
+  const detail = [fileHint, normalizedType].filter(Boolean).join(" ");
+  return detail ? `[${roleLabel} sent ${kind}: ${detail}]` : `[${roleLabel} sent ${kind}]`;
+}
+
+function dedupeTextBlocks(blocks) {
+  const seen = new Set();
+  const out = [];
+  for (const block of blocks) {
+    const normalized = normalizeText(block);
+    if (!normalized) {
+      continue;
+    }
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function pruneRecentArchiveWriteCache(nowMs = Date.now()) {
+  for (const [key, expiresAt] of recentArchiveWriteCache.entries()) {
+    if (expiresAt <= nowMs) {
+      recentArchiveWriteCache.delete(key);
+    }
+  }
+}
+
+function buildArchiveLine(entry) {
+  return `${JSON.stringify(entry)}\n`;
+}
+
+function buildArchiveWriteCacheKey(rawPath, line) {
+  return `${rawPath}|${line}`;
+}
+
+async function archiveFileHasRecentDuplicate(rawPath, line) {
+  try {
+    const stat = await fs.stat(rawPath);
+    if (!stat.isFile() || stat.size <= 0) {
+      return false;
+    }
+    const bytesToRead = Math.min(stat.size, 64 * 1024);
+    const handle = await fs.open(rawPath, "r");
+    try {
+      const buffer = Buffer.alloc(bytesToRead);
+      await handle.read(buffer, 0, bytesToRead, stat.size - bytesToRead);
+      const recentLines = buffer
+        .toString("utf8")
+        .split("\n")
+        .map((value) => value.trim())
+        .filter(Boolean)
+        .slice(-12);
+      const normalizedLine = line.trim();
+      return recentLines.includes(normalizedLine);
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return false;
+  }
+}
+
+export async function buildSearchableText(params, deps = {}) {
+  const preferredText = normalizeText(params?.preferredText);
+  const fallbackText = normalizeText(params?.fallbackText);
+  const transcript = normalizeText(params?.transcript);
+  const mediaType = String(params?.mediaType || "").trim().toLowerCase();
+  const mediaPath = normalizePathForLookup(params?.mediaPath);
+  const role = params?.role === "assistant" ? "assistant" : "user";
+  const blocks = [];
+
+  if (preferredText && !isLikelyPlaceholderText(preferredText)) {
+    blocks.push(preferredText);
+  } else if (fallbackText && !isLikelyPlaceholderText(fallbackText)) {
+    blocks.push(fallbackText);
+  }
+
+  if (transcript && !blocks.some((block) => block.includes(transcript))) {
+    blocks.push(`[Transcript]\n${transcript}`);
+  }
+
+  const dedupedBlocks = dedupeTextBlocks(blocks);
+  if (dedupedBlocks.length > 0) {
+    return dedupedBlocks.join("\n\n");
+  }
+
+  return buildMediaFallbackText({ mediaType, mediaPath, role });
+}
+
 function jsonResult(data) {
   return {
     content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
@@ -160,7 +303,7 @@ export function isBluebubblesGroupLike(value) {
   if (raw.startsWith("group:")) {
     return true;
   }
-  return BLUEBUBBLES_GROUP_GUID_RE.test(raw);
+  return BLUEBUBBLES_GROUP_GUID_RE.test(raw) || BLUEBUBBLES_CHAT_IDENTIFIER_RE.test(raw);
 }
 
 export function buildBindingCandidates(channelId, conversationId, metadata) {
@@ -217,6 +360,9 @@ export function deriveChatType(channelId, conversationId, metadata, speakerName 
   const channel = String(channelId || "").toLowerCase();
   const conv = String(conversationId || "");
   const to = String(metadata?.to || "");
+  if (metadata?.isGroup === true) {
+    return "group";
+  }
   if (metadata?.guildId || metadata?.channelName) {
     return "channel";
   }
@@ -498,24 +644,32 @@ export function matchesArchiveEntry(entry, params) {
 }
 
 export function dedupeArchiveResults(results) {
-  const seen = new Set();
+  const seen = new Map();
   const deduped = [];
   for (const entry of results) {
     const timestamp = entry.timestamp_utc || entry.timestamp_local || "";
-    const key = [
-      entry.channel,
-      entry.chat_type,
-      entry.peer_id,
-      entry.role,
-      entry.message_id || timestamp,
-      entry._path || "",
-      entry.text || "",
-    ].join("|");
-    if (seen.has(key)) {
+    const stableId = entry.message_id
+      ? `mid:${entry.message_id}`
+      : `ts:${timestamp}|path:${entry._path || ""}|text:${entry.text || ""}`;
+    const key = [entry.channel, entry.chat_type, entry.peer_id, entry.role, stableId].join("|");
+    const existingIndex = seen.get(key);
+    if (existingIndex == null) {
+      seen.set(key, deduped.length);
+      deduped.push(entry);
       continue;
     }
-    seen.add(key);
-    deduped.push(entry);
+    const existing = deduped[existingIndex];
+    const existingScore =
+      (isLikelyPlaceholderText(existing?.text) ? 0 : 10) +
+      (existing?.source === "message-preprocessed" ? 2 : 0) +
+      (existing?.source === "message-sent-internal" ? 2 : 0);
+    const nextScore =
+      (isLikelyPlaceholderText(entry?.text) ? 0 : 10) +
+      (entry?.source === "message-preprocessed" ? 2 : 0) +
+      (entry?.source === "message-sent-internal" ? 2 : 0);
+    if (nextScore >= existingScore) {
+      deduped[existingIndex] = entry;
+    }
   }
   return deduped;
 }
@@ -716,13 +870,26 @@ async function appendEventArchive(entry, workspaceDir, pluginConfig) {
   await fs.mkdir(baseDirRaw, { recursive: true });
 
   const rawPath = path.join(baseDirRaw, `${localDate}.jsonl`);
-  await fs.appendFile(rawPath, `${JSON.stringify(entry)}\n`, "utf8");
+  const line = buildArchiveLine(entry);
+  const cacheKey = buildArchiveWriteCacheKey(rawPath, line);
+  const nowMs = Date.now();
+  pruneRecentArchiveWriteCache(nowMs);
+  if (recentArchiveWriteCache.has(cacheKey)) {
+    return;
+  }
+  if (await archiveFileHasRecentDuplicate(rawPath, line)) {
+    recentArchiveWriteCache.set(cacheKey, nowMs + RECENT_ARCHIVE_WRITE_TTL_MS);
+    return;
+  }
+  await fs.appendFile(rawPath, line, "utf8");
+  recentArchiveWriteCache.set(cacheKey, nowMs + RECENT_ARCHIVE_WRITE_TTL_MS);
 }
 
 export function buildBaseEntry({
   channelId,
   conversationId,
   metadata,
+  source = "message-hook",
   role,
   speakerName,
   speakerId,
@@ -740,7 +907,7 @@ export function buildBaseEntry({
   const peerId = derivePeerId(chatType, conversationId, metadata, speakerId);
   const conversationLabel = deriveConversationLabel(channelId, conversationId, metadata, peerId);
   return {
-    source: "message-hook",
+    source,
     timestamp_utc: now.toISOString(),
     timestamp_local: formatLocalTimestamp(now),
     local_date: localDate,
@@ -758,6 +925,30 @@ export function buildBaseEntry({
     speaker_id: speakerId || null,
     text: normalizeText(text),
   };
+}
+
+function extractAgentIdFromSessionKey(sessionKey) {
+  const raw = String(sessionKey || "").trim();
+  const match = raw.match(/^agent:([^:]+):/);
+  return match ? match[1] : null;
+}
+
+function resolveWorkspaceForInternalEvent(
+  config,
+  workspaceMap,
+  sessionKey,
+  channelId,
+  conversationId,
+  metadata,
+) {
+  const agentId = extractAgentIdFromSessionKey(sessionKey);
+  if (agentId) {
+    const workspace = workspaceMap.get(agentId);
+    if (workspace) {
+      return { workspace, agentId, peerId: metadata?.groupId ?? null };
+    }
+  }
+  return resolveWorkspaceForEvent(config, workspaceMap, channelId, conversationId, metadata);
 }
 
 export default function register(api) {
@@ -799,11 +990,15 @@ export default function register(api) {
         channelId,
         conversationId: ctx?.conversationId,
         metadata: event?.metadata || {},
+        source: "message-hook",
         role: "user",
         speakerName: event?.metadata?.senderName || event?.from,
         speakerId: event?.metadata?.senderId || event?.from,
         messageId: event?.metadata?.messageId,
-        text: event?.content || "",
+        text: await buildSearchableText({
+          preferredText: event?.content || "",
+          role: "user",
+        }),
         workspaceDir: workspaceInfo.workspace,
         agentId: workspaceInfo.agentId,
         timestampMs: event?.timestamp,
@@ -828,18 +1023,25 @@ export default function register(api) {
         api.config,
         workspaceMap,
         channelId,
-        ctx?.conversationId,
-        { to: event?.to, groupId: ctx?.groupId },
+        ctx?.conversationId || event?.to,
+        { to: event?.to, conversationId: ctx?.conversationId },
       );
       const entry = buildBaseEntry({
         channelId,
         conversationId: ctx?.conversationId || event?.to,
-        metadata: {},
+        metadata: {
+          to: event?.to,
+          conversationId: ctx?.conversationId,
+        },
+        source: "message-hook",
         role: "assistant",
         speakerName: ASSISTANT_NAME,
         speakerId: null,
         messageId: ctx?.messageId,
-        text: event?.content || "",
+        text: await buildSearchableText({
+          preferredText: event?.content || "",
+          role: "assistant",
+        }),
         workspaceDir: workspaceInfo.workspace,
         agentId: workspaceInfo.agentId,
         timestampMs: Date.now(),
@@ -847,5 +1049,112 @@ export default function register(api) {
       await appendEventArchive(entry, workspaceInfo.workspace, pluginConfig);
     },
     { priority: 0 },
+  );
+
+  api.registerHook(
+    "message:preprocessed",
+    async (event) => {
+      const context = event?.context || {};
+      const channelId = String(context.channelId || "").toLowerCase();
+      if (!SUPPORTED_CHANNELS.has(channelId)) {
+        warnUnsupportedChannel(channelId);
+        return;
+      }
+      const workspaceInfo = resolveWorkspaceForInternalEvent(
+        api.config,
+        workspaceMap,
+        event?.sessionKey,
+        channelId,
+        context.conversationId,
+        {
+          to: context.to,
+          groupId: context.groupId,
+          isGroup: context.isGroup,
+        },
+      );
+      const entry = buildBaseEntry({
+        channelId,
+        conversationId: context.conversationId,
+        metadata: {
+          to: context.to,
+          groupId: context.groupId,
+          isGroup: context.isGroup,
+        },
+        source: "message-preprocessed",
+        role: "user",
+        speakerName: context.senderName || context.senderId || context.from,
+        speakerId: context.senderId || context.from,
+        messageId: context.messageId,
+        text: await buildSearchableText({
+          preferredText: context.bodyForAgent ?? context.body ?? "",
+          fallbackText: context.body ?? "",
+          transcript: context.transcript,
+          mediaPath: context.mediaPath,
+          mediaType: context.mediaType,
+          role: "user",
+        }),
+        workspaceDir: workspaceInfo.workspace,
+        agentId: workspaceInfo.agentId,
+        timestampMs: event?.timestamp?.getTime?.() ?? Date.now(),
+      });
+      await appendEventArchive(entry, workspaceInfo.workspace, pluginConfig);
+    },
+    {
+      name: "conversation-archive-preprocessed",
+      description: "Mirror preprocessed inbound message context into raw archive entries.",
+    },
+  );
+
+  api.registerHook(
+    "message:sent",
+    async (event) => {
+      const context = event?.context || {};
+      const channelId = String(context.channelId || "").toLowerCase();
+      if (!SUPPORTED_CHANNELS.has(channelId)) {
+        warnUnsupportedChannel(channelId);
+        return;
+      }
+      if (context.success !== true) {
+        return;
+      }
+      const workspaceInfo = resolveWorkspaceForInternalEvent(
+        api.config,
+        workspaceMap,
+        event?.sessionKey,
+        channelId,
+        context.conversationId || context.to,
+        {
+          to: context.to,
+          groupId: context.groupId,
+          isGroup: context.isGroup,
+        },
+      );
+      const entry = buildBaseEntry({
+        channelId,
+        conversationId: context.conversationId || context.to,
+        metadata: {
+          to: context.to,
+          groupId: context.groupId,
+          isGroup: context.isGroup,
+        },
+        source: "message-sent-internal",
+        role: "assistant",
+        speakerName: ASSISTANT_NAME,
+        speakerId: null,
+        messageId: context.messageId,
+        text: await buildSearchableText({
+          preferredText: context.content || "",
+          role: "assistant",
+        }),
+        workspaceDir: workspaceInfo.workspace,
+        agentId: workspaceInfo.agentId,
+        timestampMs: event?.timestamp?.getTime?.() ?? Date.now(),
+      });
+      await appendEventArchive(entry, workspaceInfo.workspace, pluginConfig);
+    },
+    {
+      name: "conversation-archive-sent",
+      description: "Mirror internal sent-message context into raw archive entries.",
+    },
   );
 }

@@ -116,23 +116,42 @@ def render_text(results: list[dict]) -> str:
 
 
 def dedupe_results(results: list[dict]) -> list[dict]:
-    seen = set()
-    deduped = []
+    seen: dict[tuple[object, ...], int] = {}
+    deduped: list[dict] = []
     for entry in results:
         timestamp = entry.get("timestamp_utc") or entry.get("timestamp_local") or ""
+        stable_id = (
+            f"mid:{entry.get('message_id')}"
+            if entry.get("message_id")
+            else f"ts:{timestamp}|path:{entry.get('_path') or ''}|text:{entry.get('text') or ''}"
+        )
         key = (
             entry.get("channel"),
             entry.get("chat_type"),
             entry.get("peer_id"),
             entry.get("role"),
-            entry.get("message_id") or timestamp,
-            entry.get("_path") or "",
-            entry.get("text") or "",
+            stable_id,
         )
-        if key in seen:
+        existing_index = seen.get(key)
+        if existing_index is None:
+            seen[key] = len(deduped)
+            deduped.append(entry)
             continue
-        seen.add(key)
-        deduped.append(entry)
+
+        existing = deduped[existing_index]
+
+        def score(candidate: dict) -> int:
+            text = str(candidate.get("text") or "").strip()
+            source = str(candidate.get("source") or "")
+            placeholder = text in {"", "[User sent media without caption]"} or text.startswith(
+                "<media:"
+            )
+            return (0 if placeholder else 10) + (
+                2 if source in {"message-preprocessed", "message-sent-internal"} else 0
+            )
+
+        if score(entry) >= score(existing):
+            deduped[existing_index] = entry
     return deduped
 
 

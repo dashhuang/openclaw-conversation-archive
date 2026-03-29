@@ -75,6 +75,65 @@ class SearchArchiveTest(unittest.TestCase):
             self.assertEqual(results[0]["timestamp_utc"], "2026-03-14T00:00:01.000Z")
             self.assertEqual(results[1]["timestamp_utc"], "2026-03-14T00:00:02.000Z")
 
+    def test_prefers_enriched_entry_when_message_id_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            archive_dir = tmp_path / "logs" / "message-archive-raw" / "telegram" / "group" / "telegram-100123"
+            archive_dir.mkdir(parents=True)
+            archive_file = archive_dir / "2026-03-29.jsonl"
+
+            entries = [
+                {
+                    "timestamp_utc": "2026-03-29T00:00:01.000Z",
+                    "timestamp_local": "2026-03-29T08:00:01+08:00",
+                    "local_date": "2026-03-29",
+                    "local_time": "08:00:01",
+                    "channel": "telegram",
+                    "chat_type": "group",
+                    "peer_id": "-100123",
+                    "conversation_label": "telegram:group:-100123",
+                    "conversation_slug": "telegram-100123",
+                    "message_id": "m-1",
+                    "role": "user",
+                    "speaker_name": "Dash",
+                    "source": "message-hook",
+                    "text": "[User sent media without caption]",
+                },
+                {
+                    "timestamp_utc": "2026-03-29T00:00:01.000Z",
+                    "timestamp_local": "2026-03-29T08:00:01+08:00",
+                    "local_date": "2026-03-29",
+                    "local_time": "08:00:01",
+                    "channel": "telegram",
+                    "chat_type": "group",
+                    "peer_id": "-100123",
+                    "conversation_label": "telegram:group:-100123",
+                    "conversation_slug": "telegram-100123",
+                    "message_id": "m-1",
+                    "role": "user",
+                    "speaker_name": "Dash",
+                    "source": "message-preprocessed",
+                    "text": "[Image OCR]\nAI CINEMA\n3-29 13:20",
+                },
+            ]
+
+            with archive_file.open("w", encoding="utf-8") as handle:
+                for entry in entries:
+                    handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+            proc = subprocess.run(
+                ["python3", str(SEARCH_SCRIPT), "--query", "AI CINEMA", "--limit", "10", "--json"],
+                cwd=tmp_path,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            results = json.loads(proc.stdout)
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0]["source"], "message-preprocessed")
+            self.assertIn("AI CINEMA", results[0]["text"])
+
 
 if __name__ == "__main__":
     unittest.main()
