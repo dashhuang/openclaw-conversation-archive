@@ -22,12 +22,11 @@ const {
   resolveArchiveRoot,
   resolveWorkspaceDir,
   searchArchive,
-  resolveBoundWorkspace,
-  resolveWorkspaceForEvent,
+  resolveWorkspaceFromSessionKey,
   resolveWorkspaceMap,
 } = pluginModule;
 
-test("resolveWorkspaceForEvent maps non-Telegram bindings to the bound workspace", () => {
+test("resolveWorkspaceFromSessionKey extracts agentId from sessionKey and returns workspace", () => {
   const config = {
     agents: {
       defaults: { workspace: "workspace" },
@@ -36,28 +35,48 @@ test("resolveWorkspaceForEvent maps non-Telegram bindings to the bound workspace
         { id: "food-group", workspace: "workspace-food-group" },
       ],
     },
-    bindings: [
-      {
-        agentId: "food-group",
-        match: {
-          channel: "feishu",
-          peer: { id: "ou_user_123" },
-        },
-      },
-    ],
   };
 
   const workspaceMap = resolveWorkspaceMap(config);
-  const workspaceInfo = resolveWorkspaceForEvent(
-    config,
+  const result = resolveWorkspaceFromSessionKey(
     workspaceMap,
-    "feishu",
-    "feishu:direct:ignored",
-    { senderId: "ou_user_123" },
+    "agent:food-group:feishu:direct:ou_user_123",
   );
 
-  assert.equal(workspaceInfo.workspace, "workspace-food-group");
-  assert.equal(workspaceInfo.agentId, "food-group");
+  assert.equal(result.workspace, "workspace-food-group");
+  assert.equal(result.agentId, "food-group");
+});
+
+test("resolveWorkspaceFromSessionKey returns null when sessionKey is missing", () => {
+  const config = {
+    agents: {
+      defaults: { workspace: "workspace" },
+      list: [{ id: "main", workspace: "workspace" }],
+    },
+  };
+
+  const workspaceMap = resolveWorkspaceMap(config);
+
+  assert.equal(resolveWorkspaceFromSessionKey(workspaceMap, null), null);
+  assert.equal(resolveWorkspaceFromSessionKey(workspaceMap, ""), null);
+  assert.equal(resolveWorkspaceFromSessionKey(workspaceMap, undefined), null);
+});
+
+test("resolveWorkspaceFromSessionKey returns null when agentId has no workspace", () => {
+  const config = {
+    agents: {
+      defaults: { workspace: "workspace" },
+      list: [{ id: "main", workspace: "workspace" }],
+    },
+  };
+
+  const workspaceMap = resolveWorkspaceMap(config);
+  const result = resolveWorkspaceFromSessionKey(
+    workspaceMap,
+    "agent:unknown-agent:feishu:direct:ou_user_123",
+  );
+
+  assert.equal(result, null);
 });
 
 test("buildBaseEntry prefers provider timestamps and emits a real local timestamp with offset", () => {
@@ -431,57 +450,7 @@ test("createConversationArchiveTools exposes a health tool when workspaceDir exi
   assert.equal(result.details.fileCount, 1);
 });
 
-test("resolveBoundWorkspace matches channel-only bindings (no peer)", () => {
-  const config = {
-    agents: {
-      defaults: { workspace: "workspace" },
-      list: [
-        { id: "main", workspace: "workspace" },
-        { id: "social", workspace: "workspace-social" },
-      ],
-    },
-    bindings: [
-      {
-        agentId: "social",
-        match: {
-          channel: "bluebubbles",
-        },
-      },
-      {
-        agentId: "main",
-        match: {
-          channel: "telegram",
-        },
-      },
-    ],
-  };
-
-  const workspaceMap = resolveWorkspaceMap(config);
-
-  // Channel-only binding should route BB to social workspace
-  const bbResult = resolveWorkspaceForEvent(
-    config,
-    workspaceMap,
-    "bluebubbles",
-    "chat_guid:any;+;chat240698944142298252",
-    { senderId: "+8618621185125" },
-  );
-  assert.equal(bbResult.workspace, "workspace-social");
-  assert.equal(bbResult.agentId, "social");
-
-  // Telegram should route to main
-  const tgResult = resolveWorkspaceForEvent(
-    config,
-    workspaceMap,
-    "telegram",
-    "telegram:435427284",
-    { senderId: "435427284" },
-  );
-  assert.equal(tgResult.workspace, "workspace");
-  assert.equal(tgResult.agentId, "main");
-});
-
-test("resolveBoundWorkspace prefers peer-specific over channel-only", () => {
+test("resolveWorkspaceFromSessionKey routes different agents to different workspaces", () => {
   const config = {
     agents: {
       defaults: { workspace: "workspace" },
@@ -491,44 +460,28 @@ test("resolveBoundWorkspace prefers peer-specific over channel-only", () => {
         { id: "vip", workspace: "workspace-vip" },
       ],
     },
-    bindings: [
-      {
-        agentId: "vip",
-        match: {
-          channel: "bluebubbles",
-          peer: { id: "+8618621185125" },
-        },
-      },
-      {
-        agentId: "social",
-        match: {
-          channel: "bluebubbles",
-        },
-      },
-    ],
   };
 
   const workspaceMap = resolveWorkspaceMap(config);
 
-  // Peer-specific should win over channel-only
-  const vipResult = resolveWorkspaceForEvent(
-    config,
+  const socialResult = resolveWorkspaceFromSessionKey(
     workspaceMap,
-    "bluebubbles",
-    "bluebubbles:direct:+8618621185125",
-    { senderId: "+8618621185125" },
+    "agent:social:bluebubbles:direct:+8618621185125",
+  );
+  assert.equal(socialResult.workspace, "workspace-social");
+  assert.equal(socialResult.agentId, "social");
+
+  const vipResult = resolveWorkspaceFromSessionKey(
+    workspaceMap,
+    "agent:vip:bluebubbles:direct:+8618621185125",
   );
   assert.equal(vipResult.workspace, "workspace-vip");
   assert.equal(vipResult.agentId, "vip");
 
-  // Other BB senders fall back to channel-only binding
-  const otherResult = resolveWorkspaceForEvent(
-    config,
+  const mainResult = resolveWorkspaceFromSessionKey(
     workspaceMap,
-    "bluebubbles",
-    "chat_guid:any;+;chat240698944142298252",
-    { senderId: "+8613003233705" },
+    "agent:main:telegram:direct:451740013",
   );
-  assert.equal(otherResult.workspace, "workspace-social");
-  assert.equal(otherResult.agentId, "social");
+  assert.equal(mainResult.workspace, "workspace");
+  assert.equal(mainResult.agentId, "main");
 });

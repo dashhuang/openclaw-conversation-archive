@@ -284,17 +284,6 @@ export function resolveWorkspaceMap(config) {
   return out;
 }
 
-function extractTelegramGroupId(...values) {
-  for (const value of values) {
-    const raw = String(value || "");
-    const match = raw.match(/-100\d+/);
-    if (match) {
-      return match[0];
-    }
-  }
-  return null;
-}
-
 export function isBluebubblesGroupLike(value) {
   const raw = String(value || "").trim().toLowerCase();
   if (!raw) {
@@ -306,73 +295,10 @@ export function isBluebubblesGroupLike(value) {
   return BLUEBUBBLES_GROUP_GUID_RE.test(raw) || BLUEBUBBLES_CHAT_IDENTIFIER_RE.test(raw);
 }
 
-export function buildBindingCandidates(channelId, conversationId, metadata) {
-  const candidates = new Set();
-  const push = (value) => {
-    const raw = String(value || "").trim();
-    if (!raw) {
-      return;
-    }
-    candidates.add(raw);
-    const tgGroupId = extractTelegramGroupId(raw);
-    if (tgGroupId) {
-      candidates.add(tgGroupId);
-    }
-  };
-  push(conversationId);
-  push(metadata?.to);
-  push(metadata?.groupId);
-  push(metadata?.conversationId);
-  push(metadata?.senderId);
-  push(metadata?.threadId);
-  if (String(channelId || "").toLowerCase() === "telegram") {
-    push(extractTelegramGroupId(conversationId, metadata?.to, metadata?.groupId));
-  }
-  return candidates;
-}
-
-export function resolveBoundWorkspace(config, workspaceMap, channelId, conversationId, metadata) {
-  const candidates = buildBindingCandidates(channelId, conversationId, metadata);
-  const bindings = config?.bindings || [];
-
-  // First pass: try peer-specific bindings (most specific match wins).
-  if (candidates.size > 0) {
-    for (const binding of bindings) {
-      if (String(binding?.match?.channel || "").toLowerCase() !== String(channelId || "").toLowerCase()) {
-        continue;
-      }
-      const peer = binding?.match?.peer || {};
-      const peerId = String(peer.id || "").trim();
-      if (!peerId) {
-        continue;
-      }
-      if (candidates.has(peerId)) {
-        const workspace = workspaceMap.get(String(binding.agentId));
-        if (workspace) {
-          return { workspace, agentId: String(binding.agentId), peerId };
-        }
-      }
-    }
-  }
-
-  // Second pass: channel-only bindings (no peer constraint).
-  for (const binding of bindings) {
-    if (String(binding?.match?.channel || "").toLowerCase() !== String(channelId || "").toLowerCase()) {
-      continue;
-    }
-    const peer = binding?.match?.peer || {};
-    const peerId = String(peer.id || "").trim();
-    if (peerId) {
-      continue; // skip peer-specific bindings in this pass
-    }
-    const workspace = workspaceMap.get(String(binding.agentId));
-    if (workspace) {
-      return { workspace, agentId: String(binding.agentId), peerId: null };
-    }
-  }
-
-  return null;
-}
+// Legacy binding-based routing functions removed in v0.2.0.
+// Archive workspace selection now relies solely on the sessionKey
+// provided by OpenClaw's internal hooks (message:preprocessed / message:sent).
+// See: https://github.com/dashhuang/openclaw-conversation-archive/pull/2
 
 export function deriveChatType(channelId, conversationId, metadata, speakerName = "") {
   const channel = String(channelId || "").toLowerCase();
@@ -449,24 +375,7 @@ export function derivePeerId(chatType, conversationId, metadata, fallback) {
   );
 }
 
-export function resolveWorkspaceForEvent(config, workspaceMap, channelId, conversationId, metadata) {
-  const boundWorkspace = resolveBoundWorkspace(
-    config,
-    workspaceMap,
-    channelId,
-    conversationId,
-    metadata,
-  );
-  if (boundWorkspace) {
-    return boundWorkspace;
-  }
-  const mainWorkspace = workspaceMap.get("main");
-  return {
-    workspace: mainWorkspace || String(config?.agents?.defaults?.workspace || "."),
-    agentId: "main",
-    peerId: null,
-  };
-}
+
 
 export function resolveWorkspaceDir(workspaceDir) {
   const raw = String(workspaceDir || "").trim();
@@ -951,22 +860,16 @@ function extractAgentIdFromSessionKey(sessionKey) {
   return match ? match[1] : null;
 }
 
-function resolveWorkspaceForInternalEvent(
-  config,
-  workspaceMap,
-  sessionKey,
-  channelId,
-  conversationId,
-  metadata,
-) {
+export function resolveWorkspaceFromSessionKey(workspaceMap, sessionKey) {
   const agentId = extractAgentIdFromSessionKey(sessionKey);
-  if (agentId) {
-    const workspace = workspaceMap.get(agentId);
-    if (workspace) {
-      return { workspace, agentId, peerId: metadata?.groupId ?? null };
-    }
+  if (!agentId) {
+    return null;
   }
-  return resolveWorkspaceForEvent(config, workspaceMap, channelId, conversationId, metadata);
+  const workspace = workspaceMap.get(agentId);
+  if (!workspace) {
+    return null;
+  }
+  return { workspace, agentId };
 }
 
 export default function register(api) {
@@ -989,86 +892,6 @@ export default function register(api) {
     );
   };
 
-  api.on(
-    "message_received",
-    async (event, ctx) => {
-      const channelId = String(ctx?.channelId || "").toLowerCase();
-      if (!SUPPORTED_CHANNELS.has(channelId)) {
-        warnUnsupportedChannel(channelId);
-        return;
-      }
-      const workspaceInfo = resolveWorkspaceForEvent(
-        api.config,
-        workspaceMap,
-        channelId,
-        ctx?.conversationId,
-        event?.metadata || {},
-      );
-      const entry = buildBaseEntry({
-        channelId,
-        conversationId: ctx?.conversationId,
-        metadata: event?.metadata || {},
-        source: "message-hook",
-        role: "user",
-        speakerName: event?.metadata?.senderName || event?.from,
-        speakerId: event?.metadata?.senderId || event?.from,
-        messageId: event?.metadata?.messageId,
-        text: await buildSearchableText({
-          preferredText: event?.content || "",
-          role: "user",
-        }),
-        workspaceDir: workspaceInfo.workspace,
-        agentId: workspaceInfo.agentId,
-        timestampMs: event?.timestamp,
-      });
-      await appendEventArchive(entry, workspaceInfo.workspace, pluginConfig);
-    },
-    { priority: 0 },
-  );
-
-  api.on(
-    "message_sent",
-    async (event, ctx) => {
-      const channelId = String(ctx?.channelId || "").toLowerCase();
-      if (!SUPPORTED_CHANNELS.has(channelId)) {
-        warnUnsupportedChannel(channelId);
-        return;
-      }
-      if (event?.success !== true) {
-        return;
-      }
-      const workspaceInfo = resolveWorkspaceForEvent(
-        api.config,
-        workspaceMap,
-        channelId,
-        ctx?.conversationId || event?.to,
-        { to: event?.to, conversationId: ctx?.conversationId },
-      );
-      const entry = buildBaseEntry({
-        channelId,
-        conversationId: ctx?.conversationId || event?.to,
-        metadata: {
-          to: event?.to,
-          conversationId: ctx?.conversationId,
-        },
-        source: "message-hook",
-        role: "assistant",
-        speakerName: ASSISTANT_NAME,
-        speakerId: null,
-        messageId: ctx?.messageId,
-        text: await buildSearchableText({
-          preferredText: event?.content || "",
-          role: "assistant",
-        }),
-        workspaceDir: workspaceInfo.workspace,
-        agentId: workspaceInfo.agentId,
-        timestampMs: Date.now(),
-      });
-      await appendEventArchive(entry, workspaceInfo.workspace, pluginConfig);
-    },
-    { priority: 0 },
-  );
-
   api.registerHook(
     "message:preprocessed",
     async (event) => {
@@ -1078,18 +901,10 @@ export default function register(api) {
         warnUnsupportedChannel(channelId);
         return;
       }
-      const workspaceInfo = resolveWorkspaceForInternalEvent(
-        api.config,
-        workspaceMap,
-        event?.sessionKey,
-        channelId,
-        context.conversationId,
-        {
-          to: context.to,
-          groupId: context.groupId,
-          isGroup: context.isGroup,
-        },
-      );
+      const workspaceInfo = resolveWorkspaceFromSessionKey(workspaceMap, event?.sessionKey);
+      if (!workspaceInfo) {
+        return;
+      }
       const entry = buildBaseEntry({
         channelId,
         conversationId: context.conversationId,
@@ -1135,18 +950,10 @@ export default function register(api) {
       if (context.success !== true) {
         return;
       }
-      const workspaceInfo = resolveWorkspaceForInternalEvent(
-        api.config,
-        workspaceMap,
-        event?.sessionKey,
-        channelId,
-        context.conversationId || context.to,
-        {
-          to: context.to,
-          groupId: context.groupId,
-          isGroup: context.isGroup,
-        },
-      );
+      const workspaceInfo = resolveWorkspaceFromSessionKey(workspaceMap, event?.sessionKey);
+      if (!workspaceInfo) {
+        return;
+      }
       const entry = buildBaseEntry({
         channelId,
         conversationId: context.conversationId || context.to,
