@@ -9,7 +9,11 @@
     "properties": {
       "archiveRoot": {
         "type": "string",
-        "description": "Relative archive path under each workspace. Defaults to logs/message-archive-raw."
+        "description": "Relative canonical message archive path under each workspace. Defaults to logs/message-archive-raw."
+      },
+      "eventArchiveRoot": {
+        "type": "string",
+        "description": "Relative event log path under each workspace for gateway/pipeline stage records. Defaults to logs/message-archive-events."
       },
       "warnOnUnsupportedChannels": {
         "type": "boolean",

@@ -3,6 +3,7 @@ import path from "node:path";
 
 const ASSISTANT_NAME = "Assistant";
 const DEFAULT_ARCHIVE_ROOT = path.join("logs", "message-archive-raw");
+const DEFAULT_EVENT_ARCHIVE_ROOT = path.join("logs", "message-archive-events");
 const DEFAULT_STATE_DIR = path.join(process.env.HOME || "", ".openclaw");
 const SUPPORTED_CHANNELS = new Set([
   "telegram",
@@ -333,44 +334,26 @@ export function buildBindingCandidates(channelId, conversationId, metadata) {
 
 export function resolveBoundWorkspace(config, workspaceMap, channelId, conversationId, metadata) {
   const candidates = buildBindingCandidates(channelId, conversationId, metadata);
-  const bindings = config?.bindings || [];
-
-  // First pass: try peer-specific bindings (most specific match wins).
-  if (candidates.size > 0) {
-    for (const binding of bindings) {
-      if (String(binding?.match?.channel || "").toLowerCase() !== String(channelId || "").toLowerCase()) {
-        continue;
-      }
-      const peer = binding?.match?.peer || {};
-      const peerId = String(peer.id || "").trim();
-      if (!peerId) {
-        continue;
-      }
-      if (candidates.has(peerId)) {
-        const workspace = workspaceMap.get(String(binding.agentId));
-        if (workspace) {
-          return { workspace, agentId: String(binding.agentId), peerId };
-        }
-      }
-    }
+  if (candidates.size === 0) {
+    return null;
   }
-
-  // Second pass: channel-only bindings (no peer constraint).
+  const bindings = config?.bindings || [];
   for (const binding of bindings) {
     if (String(binding?.match?.channel || "").toLowerCase() !== String(channelId || "").toLowerCase()) {
       continue;
     }
     const peer = binding?.match?.peer || {};
     const peerId = String(peer.id || "").trim();
-    if (peerId) {
-      continue; // skip peer-specific bindings in this pass
+    if (!peerId) {
+      continue;
     }
-    const workspace = workspaceMap.get(String(binding.agentId));
-    if (workspace) {
-      return { workspace, agentId: String(binding.agentId), peerId: null };
+    if (candidates.has(peerId)) {
+      const workspace = workspaceMap.get(String(binding.agentId));
+      if (workspace) {
+        return { workspace, agentId: String(binding.agentId), peerId };
+      }
     }
   }
-
   return null;
 }
 
@@ -480,6 +463,13 @@ export function resolveArchiveRoot(workspaceDir, pluginConfig = {}) {
   const configuredRoot = String(pluginConfig.archiveRoot || DEFAULT_ARCHIVE_ROOT).trim();
   const workspaceRoot = resolveWorkspaceDir(workspaceDir);
   const archiveRoot = configuredRoot || DEFAULT_ARCHIVE_ROOT;
+  return path.isAbsolute(archiveRoot) ? archiveRoot : path.join(workspaceRoot, archiveRoot);
+}
+
+export function resolveEventArchiveRoot(workspaceDir, pluginConfig = {}) {
+  const configuredRoot = String(pluginConfig.eventArchiveRoot || DEFAULT_EVENT_ARCHIVE_ROOT).trim();
+  const workspaceRoot = resolveWorkspaceDir(workspaceDir);
+  const archiveRoot = configuredRoot || DEFAULT_EVENT_ARCHIVE_ROOT;
   return path.isAbsolute(archiveRoot) ? archiveRoot : path.join(workspaceRoot, archiveRoot);
 }
 
@@ -665,10 +655,7 @@ export function dedupeArchiveResults(results) {
   const seen = new Map();
   const deduped = [];
   for (const entry of results) {
-    const timestamp = entry.timestamp_utc || entry.timestamp_local || "";
-    const stableId = entry.message_id
-      ? `mid:${entry.message_id}`
-      : `ts:${timestamp}|path:${entry._path || ""}|text:${entry.text || ""}`;
+    const stableId = buildArchiveStableId(entry);
     const key = [entry.channel, entry.chat_type, entry.peer_id, entry.role, stableId].join("|");
     const existingIndex = seen.get(key);
     if (existingIndex == null) {
@@ -677,14 +664,8 @@ export function dedupeArchiveResults(results) {
       continue;
     }
     const existing = deduped[existingIndex];
-    const existingScore =
-      (isLikelyPlaceholderText(existing?.text) ? 0 : 10) +
-      (existing?.source === "message-preprocessed" ? 2 : 0) +
-      (existing?.source === "message-sent-internal" ? 2 : 0);
-    const nextScore =
-      (isLikelyPlaceholderText(entry?.text) ? 0 : 10) +
-      (entry?.source === "message-preprocessed" ? 2 : 0) +
-      (entry?.source === "message-sent-internal" ? 2 : 0);
+    const existingScore = scoreArchiveEntry(existing);
+    const nextScore = scoreArchiveEntry(entry);
     if (nextScore >= existingScore) {
       deduped[existingIndex] = entry;
     }
@@ -870,19 +851,81 @@ export function createConversationArchiveTools(api, ctx) {
   ];
 }
 
-async function appendEventArchive(entry, workspaceDir, pluginConfig) {
+function isInternalHooksEnabled(config) {
+  return config?.hooks?.internal?.enabled === true;
+}
+
+function sourcePriority(entry) {
+  const source = String(entry?.source || "");
+  const role = String(entry?.role || "");
+  if (role === "user") {
+    if (source === "mention-skip") {
+      return 40;
+    }
+    if (source === "message-preprocessed") {
+      return 30;
+    }
+    if (source === "message-hook") {
+      return 20;
+    }
+    if (source === "import") {
+      return 10;
+    }
+    return 0;
+  }
+  if (role === "assistant") {
+    if (source === "message-sent-internal") {
+      return 30;
+    }
+    if (source === "message-hook") {
+      return 20;
+    }
+    if (source === "import") {
+      return 10;
+    }
+  }
+  return 0;
+}
+
+function buildArchiveFallbackStableId(entry) {
+  return [
+    `peer:${entry.peer_id || entry.conversation_slug || entry.conversation_label || ""}`,
+    `role:${entry.role || ""}`,
+    `speaker:${entry.speaker_id || entry.speaker_name || ""}`,
+    `date:${entry.local_date || ""}`,
+    `time:${entry.local_time || ""}`,
+    `text:${entry.text || ""}`,
+  ].join("|");
+}
+
+export function buildArchiveStableId(entry) {
+  if (entry?.role === "user" && entry?.source_message_id) {
+    return `smid:${entry.source_message_id}`;
+  }
+  if (entry?.message_id) {
+    return `mid:${entry.message_id}`;
+  }
+  return `fallback:${buildArchiveFallbackStableId(entry)}`;
+}
+
+export function scoreArchiveEntry(entry) {
+  const hasMeaningfulText = isLikelyPlaceholderText(entry?.text) ? 0 : 10;
+  return hasMeaningfulText + sourcePriority(entry);
+}
+
+async function appendArchive(entry, workspaceDir, archiveRootResolver, pluginConfig) {
   const localDate = entry.local_date;
   const conversationParts = [
     entry.channel,
     entry.chat_type,
     entry.conversation_slug,
   ];
-  let archiveRoot = resolveArchiveRoot(workspaceDir, pluginConfig);
+  let archiveRoot = archiveRootResolver(workspaceDir, pluginConfig);
   if (!path.isAbsolute(archiveRoot)) {
-    archiveRoot = resolveArchiveRoot(entry.workspace || workspaceDir, pluginConfig);
+    archiveRoot = archiveRootResolver(entry.workspace || workspaceDir, pluginConfig);
   }
   if (!path.isAbsolute(archiveRoot)) {
-    archiveRoot = path.join(resolveWorkspaceDir(entry.workspace || workspaceDir), DEFAULT_ARCHIVE_ROOT);
+    archiveRoot = archiveRootResolver(entry.workspace || workspaceDir, pluginConfig);
   }
   const baseDirRaw = path.join(archiveRoot, ...conversationParts);
   await fs.mkdir(baseDirRaw, { recursive: true });
@@ -901,6 +944,14 @@ async function appendEventArchive(entry, workspaceDir, pluginConfig) {
   }
   await fs.appendFile(rawPath, line, "utf8");
   recentArchiveWriteCache.set(cacheKey, nowMs + RECENT_ARCHIVE_WRITE_TTL_MS);
+}
+
+async function appendMessageArchive(entry, workspaceDir, pluginConfig) {
+  return appendArchive(entry, workspaceDir, resolveArchiveRoot, pluginConfig);
+}
+
+async function appendEventArchive(entry, workspaceDir, pluginConfig) {
+  return appendArchive(entry, workspaceDir, resolveEventArchiveRoot, pluginConfig);
 }
 
 export function buildBaseEntry({
@@ -938,6 +989,7 @@ export function buildBaseEntry({
     conversation_label: conversationLabel,
     conversation_slug: sanitizeSlug(peerId || conversationLabel),
     message_id: messageId || null,
+    source_message_id: metadata?.sourceMessageId || null,
     role,
     speaker_name: speakerName || (role === "assistant" ? ASSISTANT_NAME : "User"),
     speaker_id: speakerId || null,
@@ -973,6 +1025,7 @@ export default function register(api) {
   const workspaceMap = resolveWorkspaceMap(api.config);
   const pluginConfig = resolvePluginConfig(api);
   const warnOnUnsupportedChannels = pluginConfig.warnOnUnsupportedChannels !== false;
+  const routeGatewayHooksToEventLog = isInternalHooksEnabled(api.config);
 
   api.registerTool((ctx) => createConversationArchiveTools(api, ctx), {
     names: ["conversation_archive_search", "conversation_archive_health"],
@@ -1021,7 +1074,8 @@ export default function register(api) {
         agentId: workspaceInfo.agentId,
         timestampMs: event?.timestamp,
       });
-      await appendEventArchive(entry, workspaceInfo.workspace, pluginConfig);
+      const append = routeGatewayHooksToEventLog ? appendEventArchive : appendMessageArchive;
+      await append(entry, workspaceInfo.workspace, pluginConfig);
     },
     { priority: 0 },
   );
@@ -1064,7 +1118,8 @@ export default function register(api) {
         agentId: workspaceInfo.agentId,
         timestampMs: Date.now(),
       });
-      await appendEventArchive(entry, workspaceInfo.workspace, pluginConfig);
+      const append = routeGatewayHooksToEventLog ? appendEventArchive : appendMessageArchive;
+      await append(entry, workspaceInfo.workspace, pluginConfig);
     },
     { priority: 0 },
   );
@@ -1115,7 +1170,7 @@ export default function register(api) {
         agentId: workspaceInfo.agentId,
         timestampMs: event?.timestamp?.getTime?.() ?? Date.now(),
       });
-      await appendEventArchive(entry, workspaceInfo.workspace, pluginConfig);
+      await appendMessageArchive(entry, workspaceInfo.workspace, pluginConfig);
     },
     {
       name: "conversation-archive-preprocessed",
@@ -1168,7 +1223,7 @@ export default function register(api) {
         agentId: workspaceInfo.agentId,
         timestampMs: event?.timestamp?.getTime?.() ?? Date.now(),
       });
-      await appendEventArchive(entry, workspaceInfo.workspace, pluginConfig);
+      await appendMessageArchive(entry, workspaceInfo.workspace, pluginConfig);
     },
     {
       name: "conversation-archive-sent",

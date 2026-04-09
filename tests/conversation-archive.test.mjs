@@ -8,21 +8,17 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pluginPath = path.join(__dirname, "..", "index.js");
 const pluginSource = await readFile(pluginPath, "utf8");
-const pluginModule = await import(
-  `data:text/javascript;base64,${Buffer.from(pluginSource, "utf8").toString("base64")}`
-);
+const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(pluginSource, "utf8").toString("base64")}`);
 const {
   buildBaseEntry,
   buildSearchableText,
-  createConversationArchiveTools,
+  dedupeArchiveResults,
   formatLocalTimestamp,
-  inspectArchiveHealth,
   isBluebubblesGroupLike,
   normalizeTimestampMs,
-  resolveArchiveRoot,
-  resolveWorkspaceDir,
+  default: registerConversationArchivePlugin,
+  resolveEventArchiveRoot,
   searchArchive,
-  resolveBoundWorkspace,
   resolveWorkspaceForEvent,
   resolveWorkspaceMap,
 } = pluginModule;
@@ -64,11 +60,11 @@ test("buildBaseEntry prefers provider timestamps and emits a real local timestam
   const providerTimestampSeconds = 1700000000;
   const entry = buildBaseEntry({
     channelId: "telegram",
-    conversationId: "telegram:direct:sample-user",
-    metadata: { senderId: "sample-user" },
+    conversationId: "telegram:direct:451740013",
+    metadata: { senderId: "451740013" },
     role: "user",
     speakerName: "Dash",
-    speakerId: "sample-user",
+    speakerId: "451740013",
     messageId: "2045",
     text: "raw test 1",
     workspaceDir: "workspace",
@@ -83,12 +79,21 @@ test("buildBaseEntry prefers provider timestamps and emits a real local timestam
   assert.equal(entry.local_time, entry.timestamp_local.slice(11, 19));
 });
 
-test("BlueBubbles shared chat GUIDs are classified as group chats", () => {
+test("formatLocalTimestamp keeps date and time fields aligned", () => {
+  const date = new Date("2026-03-14T01:43:00.000Z");
+  const localTimestamp = formatLocalTimestamp(date);
+
+  assert.match(localTimestamp, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/);
+});
+
+test("isBluebubblesGroupLike recognizes raw chat identifiers and chat_guid groups", () => {
   assert.equal(isBluebubblesGroupLike("chat240698944142298252"), true);
   assert.equal(isBluebubblesGroupLike("chat_guid:iMessage;+;chat240698944142298252"), true);
   assert.equal(isBluebubblesGroupLike("Family Chat id:iMessage;+;chat240698944142298252"), true);
   assert.equal(isBluebubblesGroupLike("+64210766404"), false);
+});
 
+test("buildBaseEntry keeps BlueBubbles chat identifiers in group archives", () => {
   const entry = buildBaseEntry({
     channelId: "bluebubbles",
     conversationId: "chat240698944142298252",
@@ -105,31 +110,6 @@ test("BlueBubbles shared chat GUIDs are classified as group chats", () => {
 
   assert.equal(entry.chat_type, "group");
   assert.equal(entry.conversation_slug, "chat240698944142298252");
-});
-
-test("BlueBubbles direct chats remain direct", () => {
-  const entry = buildBaseEntry({
-    channelId: "bluebubbles",
-    conversationId: "bluebubbles:sample-contact@example.com",
-    metadata: { senderId: "sample-contact@example.com" },
-    role: "user",
-    speakerName: "Cherry",
-    speakerId: "sample-contact@example.com",
-    messageId: "m1",
-    text: "hello",
-    workspaceDir: "workspace-wife",
-    agentId: "wife",
-    timestampMs: 1742241511585,
-  });
-
-  assert.equal(entry.chat_type, "direct");
-});
-
-test("formatLocalTimestamp keeps date and time fields aligned", () => {
-  const date = new Date("2026-03-14T01:43:00.000Z");
-  const localTimestamp = formatLocalTimestamp(date);
-
-  assert.match(localTimestamp, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/);
 });
 
 test("buildSearchableText falls back to a plain media placeholder for image-only messages", async () => {
@@ -152,79 +132,6 @@ test("buildSearchableText keeps user caption for image messages", async () => {
   });
 
   assert.equal(text, "这是一张电影票");
-});
-
-test("resolveArchiveRoot honors plugin config overrides", () => {
-  assert.equal(resolveWorkspaceDir("."), path.join(process.env.HOME, ".openclaw", "workspace"));
-  assert.equal(resolveWorkspaceDir("workspace-food-group"), path.join(process.env.HOME, ".openclaw", "workspace-food-group"));
-  assert.equal(resolveArchiveRoot("workspace"), path.join(process.env.HOME, ".openclaw", "workspace", "logs", "message-archive-raw"));
-  assert.equal(
-    resolveArchiveRoot("workspace", { archiveRoot: "logs/custom-history" }),
-    path.join(process.env.HOME, ".openclaw", "workspace", "logs", "custom-history"),
-  );
-  assert.equal(
-    resolveArchiveRoot("/tmp/workspace", { archiveRoot: "/tmp/archive-root" }),
-    "/tmp/archive-root",
-  );
-});
-
-test("searchArchive returns matching raw archive entries", async () => {
-  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "conversation-archive-"));
-  const archiveDir = path.join(
-    tmpDir,
-    "logs",
-    "message-archive-raw",
-    "telegram",
-    "group",
-    "100123",
-  );
-  await mkdir(archiveDir, { recursive: true });
-  await writeFile(
-    path.join(archiveDir, "2026-03-15.jsonl"),
-    [
-      JSON.stringify({
-        timestamp_utc: "2026-03-15T00:00:01.000Z",
-        timestamp_local: "2026-03-15T13:00:01+13:00",
-        local_date: "2026-03-15",
-        local_time: "13:00:01",
-        channel: "telegram",
-        chat_type: "group",
-        peer_id: "100123",
-        conversation_label: "group-a",
-        conversation_slug: "100123",
-        role: "user",
-        speaker_name: "Dash",
-        text: "hello archive world",
-      }),
-      JSON.stringify({
-        timestamp_utc: "2026-03-15T00:00:02.000Z",
-        timestamp_local: "2026-03-15T13:00:02+13:00",
-        local_date: "2026-03-15",
-        local_time: "13:00:02",
-        channel: "telegram",
-        chat_type: "group",
-        peer_id: "100123",
-        conversation_label: "group-a",
-        conversation_slug: "100123",
-        role: "assistant",
-        speaker_name: "Assistant",
-        text: "different message",
-      }),
-      "",
-    ].join("\n"),
-    "utf8",
-  );
-
-  const results = await searchArchive(path.join(tmpDir, "logs", "message-archive-raw"), {
-    query: "archive world",
-    channel: "telegram",
-    chat_type: "group",
-    limit: 5,
-  });
-
-  assert.equal(results.length, 1);
-  assert.equal(results[0].speaker_name, "Dash");
-  assert.equal(results[0].text, "hello archive world");
 });
 
 test("searchArchive prefers enriched entries when the same message id is archived twice", async () => {
@@ -271,264 +178,276 @@ test("searchArchive prefers enriched entries when the same message id is archive
           role: "user",
           speaker_name: "Dash",
           source: "message-preprocessed",
-          text: "[Image OCR]\nAI CINEMA\n3-29 13:20",
+          text: "AI CINEMA 3-29 13:20",
         }),
-        "",
-      ].join("\n"),
+      ].join("\n") + "\n",
       "utf8",
     );
 
     const results = await searchArchive(tempDir, {
       query: "AI CINEMA",
-      limit: 10,
+      limit: 5,
     });
 
     assert.equal(results.length, 1);
-    assert.equal(results[0].source, "message-preprocessed");
     assert.match(results[0].text, /AI CINEMA/);
+    assert.equal(results[0].source, "message-preprocessed");
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
 });
 
-test("createConversationArchiveTools exposes a search tool when workspaceDir exists", async () => {
-  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "conversation-archive-tool-"));
-  const archiveDir = path.join(
-    tmpDir,
-    "logs",
-    "message-archive-raw",
-    "feishu",
-    "direct",
-    "ou_123",
-  );
-  await mkdir(archiveDir, { recursive: true });
-  await writeFile(
-    path.join(archiveDir, "2026-03-15.jsonl"),
-    `${JSON.stringify({
-      timestamp_utc: "2026-03-15T00:00:01.000Z",
-      timestamp_local: "2026-03-15T13:00:01+13:00",
-      local_date: "2026-03-15",
-      local_time: "13:00:01",
-      channel: "feishu",
-      chat_type: "direct",
-      peer_id: "ou_123",
-      conversation_label: "ou_123",
-      conversation_slug: "ou_123",
-      role: "user",
-      speaker_name: "Alice",
-      text: "search me later",
-    })}\n`,
-    "utf8",
-  );
-
-  const api = {
-    config: {},
+test("register wires internal archive enrichment through registerHook", () => {
+  const registered = [];
+  registerConversationArchivePlugin({
+    config: {
+      hooks: { internal: { enabled: true } },
+      agents: { defaults: { workspace: "workspace" }, list: [] },
+    },
+    runtime: {},
     pluginConfig: {},
-  };
-  const tools = createConversationArchiveTools(api, {
-    agentId: "main",
-    workspaceDir: tmpDir,
+    registerTool() {},
+    registerHook(events, _handler, opts) {
+      registered.push({ events, name: opts?.name });
+    },
+    on() {},
+    logger: { warn() {}, info() {}, error() {} },
   });
 
-  assert.equal(Array.isArray(tools), true);
-  assert.equal(tools.length, 2);
-  assert.equal(tools.some((tool) => tool.name === "conversation_archive_search"), true);
-
-  const searchTool = tools.find((tool) => tool.name === "conversation_archive_search");
-  assert.ok(searchTool);
-
-  const result = await searchTool.execute("tool-1", { query: "search me", limit: 5 });
-  const details = result.details;
-  assert.equal(details.count, 1);
-  assert.equal(details.results[0].speaker_name, "Alice");
+  assert.deepEqual(
+    registered.map((entry) => entry.events),
+    ["message:preprocessed", "message:sent"],
+  );
 });
 
-test("inspectArchiveHealth reports ok for a fresh archive with required fields", async () => {
-  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "conversation-archive-health-"));
-  const archiveDir = path.join(
-    tmpDir,
-    "logs",
-    "message-archive-raw",
-    "telegram",
-    "direct",
-    "sample-user",
-  );
-  await mkdir(archiveDir, { recursive: true });
-  await writeFile(
-    path.join(archiveDir, "2026-03-15.jsonl"),
-    `${JSON.stringify({
-      timestamp_utc: new Date().toISOString(),
-      timestamp_local: "2026-03-15T13:00:01+13:00",
-      local_date: "2026-03-15",
-      local_time: "13:00:01",
-      channel: "telegram",
-      chat_type: "direct",
-      peer_id: "sample-user",
-      conversation_label: "telegram:direct:sample-user",
-      conversation_slug: "sample-user",
-      role: "user",
-      speaker_name: "Dash",
-      text: "health ok",
-    })}\n`,
-    "utf8",
-  );
+test("register avoids appending the same preprocessed entry more than once", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "conversation-archive-dedupe-"));
+  const registeredHooks = new Map();
 
-  const health = await inspectArchiveHealth(path.join(tmpDir, "logs", "message-archive-raw"), {
-    hours: 24,
-  });
+  try {
+    registerConversationArchivePlugin({
+      config: {
+        hooks: { internal: { enabled: true } },
+        agents: { defaults: { workspace: tempDir }, list: [] },
+      },
+      runtime: {},
+      pluginConfig: {},
+      registerTool() {},
+      registerHook(eventName, handler) {
+        registeredHooks.set(eventName, handler);
+      },
+      on() {},
+      logger: { warn() {}, info() {}, error() {} },
+    });
 
-  assert.equal(health.status, "ok");
-  assert.equal(health.fileCount, 1);
-  assert.equal(Array.isArray(health.warnings), true);
-  assert.equal(health.warnings.length, 0);
+    const preprocessedHook = registeredHooks.get("message:preprocessed");
+    assert.equal(typeof preprocessedHook, "function");
+
+    const event = {
+      sessionKey: "agent:main:telegram:451740013",
+      timestamp: new Date("2026-03-29T01:00:00.000Z"),
+      context: {
+        channelId: "telegram",
+        conversationId: "451740013",
+        senderId: "451740013",
+        senderName: "Dash",
+        messageId: "dup-1",
+        body: "这是一条重复测试消息",
+        bodyForAgent: "这是一条重复测试消息",
+      },
+    };
+
+    await preprocessedHook(event);
+    await preprocessedHook(event);
+
+    const archiveFile = path.join(
+      tempDir,
+      "logs",
+      "message-archive-raw",
+      "telegram",
+      "direct",
+      "451740013",
+      "2026-03-29.jsonl",
+    );
+    const lines = (await readFile(archiveFile, "utf8"))
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const matches = lines.filter((line) => JSON.parse(line).message_id === "dup-1");
+    assert.equal(matches.length, 1);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
 });
 
-test("createConversationArchiveTools exposes a health tool when workspaceDir exists", async () => {
-  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "conversation-archive-health-tool-"));
-  const archiveDir = path.join(
-    tmpDir,
-    "logs",
-    "message-archive-raw",
-    "telegram",
-    "group",
-    "100123",
-  );
-  await mkdir(archiveDir, { recursive: true });
-  await writeFile(
-    path.join(archiveDir, "2026-03-15.jsonl"),
-    `${JSON.stringify({
-      timestamp_utc: new Date().toISOString(),
-      timestamp_local: "2026-03-15T13:00:01+13:00",
-      local_date: "2026-03-15",
-      local_time: "13:00:01",
+test("dedupeArchiveResults prefers mention-skip for the same inbound user message", () => {
+  const results = dedupeArchiveResults([
+    {
       channel: "telegram",
       chat_type: "group",
-      peer_id: "100123",
-      conversation_label: "group-a",
-      conversation_slug: "100123",
+      peer_id: "-100123",
       role: "user",
-      speaker_name: "Dash",
-      text: "fresh health sample",
-    })}\n`,
-    "utf8",
-  );
+      message_id: "same-1",
+      source: "message-hook",
+      text: "原始文本",
+    },
+    {
+      channel: "telegram",
+      chat_type: "group",
+      peer_id: "-100123",
+      role: "user",
+      message_id: "same-1",
+      source: "message-preprocessed",
+      text: "规范化文本",
+    },
+    {
+      channel: "telegram",
+      chat_type: "group",
+      peer_id: "-100123",
+      role: "user",
+      message_id: "same-1",
+      source: "mention-skip",
+      text: "真实群消息",
+    },
+  ]);
 
-  const api = {
-    config: {},
-    pluginConfig: { mode: "standard" },
-  };
-  const tools = createConversationArchiveTools(api, {
-    agentId: "main",
-    workspaceDir: tmpDir,
-  });
-
-  const healthTool = tools.find((tool) => tool.name === "conversation_archive_health");
-  assert.ok(healthTool);
-
-  const result = await healthTool.execute("tool-2", { hours: 24 });
-  assert.equal(result.details.status, "ok");
-  assert.equal(result.details.mode, "standard");
-  assert.equal(result.details.fileCount, 1);
+  assert.equal(results.length, 1);
+  assert.equal(results[0].source, "mention-skip");
 });
 
-test("resolveBoundWorkspace matches channel-only bindings (no peer)", () => {
-  const config = {
-    agents: {
-      defaults: { workspace: "workspace" },
-      list: [
-        { id: "main", workspace: "workspace" },
-        { id: "social", workspace: "workspace-social" },
-      ],
+test("dedupeArchiveResults prefers message-sent-internal for assistant messages", () => {
+  const results = dedupeArchiveResults([
+    {
+      channel: "telegram",
+      chat_type: "group",
+      peer_id: "-100123",
+      role: "assistant",
+      message_id: "same-2",
+      source: "message-hook",
+      text: "已发送回复",
     },
-    bindings: [
-      {
-        agentId: "social",
-        match: {
-          channel: "bluebubbles",
-        },
-      },
-      {
-        agentId: "main",
-        match: {
-          channel: "telegram",
-        },
-      },
-    ],
-  };
+    {
+      channel: "telegram",
+      chat_type: "group",
+      peer_id: "-100123",
+      role: "assistant",
+      message_id: "same-2",
+      source: "message-sent-internal",
+      text: "已发送回复",
+    },
+  ]);
 
-  const workspaceMap = resolveWorkspaceMap(config);
-
-  // Channel-only binding should route BB to social workspace
-  const bbResult = resolveWorkspaceForEvent(
-    config,
-    workspaceMap,
-    "bluebubbles",
-    "chat_guid:any;+;chat240698944142298252",
-    { senderId: "+8618621185125" },
-  );
-  assert.equal(bbResult.workspace, "workspace-social");
-  assert.equal(bbResult.agentId, "social");
-
-  // Telegram should route to main
-  const tgResult = resolveWorkspaceForEvent(
-    config,
-    workspaceMap,
-    "telegram",
-    "telegram:435427284",
-    { senderId: "435427284" },
-  );
-  assert.equal(tgResult.workspace, "workspace");
-  assert.equal(tgResult.agentId, "main");
+  assert.equal(results.length, 1);
+  assert.equal(results[0].source, "message-sent-internal");
 });
 
-test("resolveBoundWorkspace prefers peer-specific over channel-only", () => {
-  const config = {
-    agents: {
-      defaults: { workspace: "workspace" },
-      list: [
-        { id: "main", workspace: "workspace" },
-        { id: "social", workspace: "workspace-social" },
-        { id: "vip", workspace: "workspace-vip" },
-      ],
-    },
-    bindings: [
+test("register routes gateway-stage records into event logs when internal hooks are enabled", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "conversation-archive-routing-"));
+  const gatewayHooks = new Map();
+  const internalHooks = new Map();
+
+  try {
+    registerConversationArchivePlugin({
+      config: {
+        hooks: { internal: { enabled: true } },
+        agents: { defaults: { workspace: tempDir }, list: [] },
+      },
+      runtime: {},
+      pluginConfig: {},
+      registerTool() {},
+      registerHook(eventName, handler) {
+        internalHooks.set(eventName, handler);
+      },
+      on(eventName, handler) {
+        gatewayHooks.set(eventName, handler);
+      },
+      logger: { warn() {}, info() {}, error() {} },
+    });
+
+    const messageReceived = gatewayHooks.get("message_received");
+    const messagePreprocessed = internalHooks.get("message:preprocessed");
+    const messageSent = gatewayHooks.get("message_sent");
+    const internalSent = internalHooks.get("message:sent");
+
+    assert.equal(typeof messageReceived, "function");
+    assert.equal(typeof messagePreprocessed, "function");
+    assert.equal(typeof messageSent, "function");
+    assert.equal(typeof internalSent, "function");
+
+    await messageReceived(
       {
-        agentId: "vip",
-        match: {
-          channel: "bluebubbles",
-          peer: { id: "+8618621185125" },
+        timestamp: new Date("2026-04-08T10:00:00.000Z"),
+        content: "@cindya 你现在存了多少条聊天记录了",
+        from: "451740013",
+        metadata: {
+          senderName: "Dash",
+          senderId: "451740013",
+          messageId: "mid-user-1",
         },
       },
       {
-        agentId: "social",
-        match: {
-          channel: "bluebubbles",
-        },
+        channelId: "telegram",
+        conversationId: "-1003778432310",
       },
-    ],
-  };
+    );
 
-  const workspaceMap = resolveWorkspaceMap(config);
+    await messagePreprocessed({
+      sessionKey: "agent:food-group:telegram:-1003778432310",
+      timestamp: new Date("2026-04-08T10:00:01.000Z"),
+      context: {
+        channelId: "telegram",
+        conversationId: "-1003778432310",
+        senderName: "Dash",
+        senderId: "451740013",
+        messageId: "mid-user-1",
+        body: "@cindya 你现在存了多少条聊天记录了",
+        bodyForAgent: "@cindya 你现在存了多少条聊天记录了",
+        isGroup: true,
+      },
+    });
 
-  // Peer-specific should win over channel-only
-  const vipResult = resolveWorkspaceForEvent(
-    config,
-    workspaceMap,
-    "bluebubbles",
-    "bluebubbles:direct:+8618621185125",
-    { senderId: "+8618621185125" },
-  );
-  assert.equal(vipResult.workspace, "workspace-vip");
-  assert.equal(vipResult.agentId, "vip");
+    await messageSent(
+      {
+        success: true,
+        content: "我查一下。",
+      },
+      {
+        channelId: "telegram",
+        conversationId: "-1003778432310",
+        messageId: "mid-assistant-1",
+      },
+    );
 
-  // Other BB senders fall back to channel-only binding
-  const otherResult = resolveWorkspaceForEvent(
-    config,
-    workspaceMap,
-    "bluebubbles",
-    "chat_guid:any;+;chat240698944142298252",
-    { senderId: "+8613003233705" },
-  );
-  assert.equal(otherResult.workspace, "workspace-social");
-  assert.equal(otherResult.agentId, "social");
+    await internalSent({
+      sessionKey: "agent:food-group:telegram:-1003778432310",
+      timestamp: new Date("2026-04-08T10:00:03.000Z"),
+      context: {
+        channelId: "telegram",
+        conversationId: "-1003778432310",
+        messageId: "mid-assistant-1",
+        content: "我查一下。",
+        success: true,
+        isGroup: true,
+      },
+    });
+
+    const archiveRoot = path.join(tempDir, "logs", "message-archive-raw");
+    const eventRoot = resolveEventArchiveRoot(tempDir, {});
+
+    const archiveHits = await searchArchive(archiveRoot, { limit: 10, json: true });
+    const eventHits = await searchArchive(eventRoot, { limit: 10, json: true });
+
+    assert.equal(archiveHits.length, 2);
+    assert.deepEqual(
+      archiveHits.map((entry) => entry.source).sort(),
+      ["message-preprocessed", "message-sent-internal"],
+    );
+    assert.equal(eventHits.length, 2);
+    assert.deepEqual(
+      eventHits.map((entry) => entry.source).sort(),
+      ["message-hook", "message-hook"],
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
 });

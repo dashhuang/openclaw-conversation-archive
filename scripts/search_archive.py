@@ -115,22 +115,66 @@ def render_text(results: list[dict]) -> str:
     return "\n".join(lines).rstrip()
 
 
+def source_priority(entry: dict) -> int:
+    source = str(entry.get("source") or "")
+    role = str(entry.get("role") or "")
+    if role == "user":
+        if source == "mention-skip":
+            return 40
+        if source == "message-preprocessed":
+            return 30
+        if source == "message-hook":
+            return 20
+        if source == "import":
+            return 10
+        return 0
+    if role == "assistant":
+        if source == "message-sent-internal":
+            return 30
+        if source == "message-hook":
+            return 20
+        if source == "import":
+            return 10
+    return 0
+
+
+def fallback_stable_id(entry: dict) -> str:
+    return "|".join(
+        [
+            f"peer:{entry.get('peer_id') or entry.get('conversation_slug') or entry.get('conversation_label') or ''}",
+            f"role:{entry.get('role') or ''}",
+            f"speaker:{entry.get('speaker_id') or entry.get('speaker_name') or ''}",
+            f"date:{entry.get('local_date') or ''}",
+            f"time:{entry.get('local_time') or ''}",
+            f"text:{entry.get('text') or ''}",
+        ]
+    )
+
+
+def stable_id(entry: dict) -> str:
+    if entry.get("role") == "user" and entry.get("source_message_id"):
+        return f"smid:{entry['source_message_id']}"
+    if entry.get("message_id"):
+        return f"mid:{entry['message_id']}"
+    return f"fallback:{fallback_stable_id(entry)}"
+
+
+def score(candidate: dict) -> int:
+    text = str(candidate.get("text") or "").strip()
+    placeholder = text in {"", "[User sent media without caption]"} or text.startswith("<media:")
+    return (0 if placeholder else 10) + source_priority(candidate)
+
+
 def dedupe_results(results: list[dict]) -> list[dict]:
     seen: dict[tuple[object, ...], int] = {}
     deduped: list[dict] = []
     for entry in results:
-        timestamp = entry.get("timestamp_utc") or entry.get("timestamp_local") or ""
-        stable_id = (
-            f"mid:{entry.get('message_id')}"
-            if entry.get("message_id")
-            else f"ts:{timestamp}|path:{entry.get('_path') or ''}|text:{entry.get('text') or ''}"
-        )
         key = (
             entry.get("channel"),
             entry.get("chat_type"),
             entry.get("peer_id"),
             entry.get("role"),
-            stable_id,
+            stable_id(entry),
         )
         existing_index = seen.get(key)
         if existing_index is None:
@@ -139,16 +183,6 @@ def dedupe_results(results: list[dict]) -> list[dict]:
             continue
 
         existing = deduped[existing_index]
-
-        def score(candidate: dict) -> int:
-            text = str(candidate.get("text") or "").strip()
-            source = str(candidate.get("source") or "")
-            placeholder = text in {"", "[User sent media without caption]"} or text.startswith(
-                "<media:"
-            )
-            return (0 if placeholder else 10) + (
-                2 if source in {"message-preprocessed", "message-sent-internal"} else 0
-            )
 
         if score(entry) >= score(existing):
             deduped[existing_index] = entry

@@ -27,18 +27,18 @@ If archive data exists in `logs/message-archive-raw/`, this skill can search it,
 2. If the user needs exact wording, chronology, or channel-specific confirmation, search the raw archive:
 
 ```bash
-python3 packages/conversation-archive/scripts/search_archive.py --query "keyword" --limit 8
+python3 scripts/search_archive.py --query "keyword" --limit 8
 ```
 
 3. Add filters when useful:
 
 ```bash
-python3 packages/conversation-archive/scripts/search_archive.py --channel telegram --chat-type group --query "OpenClaw"
-python3 packages/conversation-archive/scripts/search_archive.py --channel bluebubbles --chat-type direct --sender "Cherry" --limit 5
-python3 packages/conversation-archive/scripts/search_archive.py --from-date 2026-03-01 --to-date 2026-03-14 --query "Confluence"
-python3 packages/conversation-archive/scripts/search_archive.py --channel chatgpt --query "memory export"
-python3 packages/conversation-archive/scripts/search_archive.py --channel claude --query "project plan"
-python3 packages/conversation-archive/scripts/search_archive.py --query "shareholder letter" --limit 5
+python3 scripts/search_archive.py --channel telegram --chat-type group --query "OpenClaw"
+python3 scripts/search_archive.py --channel bluebubbles --chat-type direct --sender "Cherry" --limit 5
+python3 scripts/search_archive.py --from-date 2026-03-01 --to-date 2026-03-14 --query "Confluence"
+python3 scripts/search_archive.py --channel chatgpt --query "memory export"
+python3 scripts/search_archive.py --channel claude --query "project plan"
+python3 scripts/search_archive.py --query "shareholder letter" --limit 5
 ```
 
 Use channel filters when the source is known.
