@@ -113,6 +113,135 @@ function sanitizeSlug(value) {
   return slug || "unknown";
 }
 
+function normalizeOptionalString(value) {
+  const raw = String(value || "").trim();
+  return raw || undefined;
+}
+
+function stripChannelPrefix(value, channelId) {
+  const raw = normalizeOptionalString(value);
+  if (!raw) {
+    return undefined;
+  }
+  const genericPrefixes = ["channel:", "chat:", "user:"];
+  for (const prefix of genericPrefixes) {
+    if (raw.startsWith(prefix)) {
+      return raw.slice(prefix.length).trim() || undefined;
+    }
+  }
+  const channel = String(channelId || "").trim().toLowerCase();
+  const channelPrefix = channel ? `${channel}:` : "";
+  if (channelPrefix && raw.toLowerCase().startsWith(channelPrefix)) {
+    return raw.slice(channelPrefix.length).trim() || undefined;
+  }
+  return raw;
+}
+
+function stripTelegramInternalPrefixes(value) {
+  let trimmed = String(value || "").trim();
+  let strippedTelegramPrefix = false;
+  while (true) {
+    const next = (() => {
+      if (/^(telegram|tg):/i.test(trimmed)) {
+        strippedTelegramPrefix = true;
+        return trimmed.replace(/^(telegram|tg):/i, "").trim();
+      }
+      if (strippedTelegramPrefix && /^group:/i.test(trimmed)) {
+        return trimmed.replace(/^group:/i, "").trim();
+      }
+      return trimmed;
+    })();
+    if (next === trimmed) {
+      return trimmed;
+    }
+    trimmed = next;
+  }
+}
+
+function parseTelegramTarget(value) {
+  const normalized = stripTelegramInternalPrefixes(value);
+  const topicMatch = /^(.+?):topic:(\d+)$/i.exec(normalized);
+  if (topicMatch) {
+    return { chatId: topicMatch[1], threadId: topicMatch[2] };
+  }
+  const colonMatch = /^(.+):(\d+)$/i.exec(normalized);
+  if (colonMatch) {
+    return { chatId: colonMatch[1], threadId: colonMatch[2] };
+  }
+  return { chatId: normalized };
+}
+
+function buildTelegramTopicConversationId(chatId, topicId) {
+  const normalizedChatId = String(chatId || "").trim();
+  const normalizedTopicId = String(topicId || "").trim();
+  if (!/^-?\d+$/.test(normalizedChatId) || !/^\d+$/.test(normalizedTopicId)) {
+    return null;
+  }
+  return `${normalizedChatId}:topic:${normalizedTopicId}`;
+}
+
+function normalizeTelegramConversationId(value, threadId) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+  const parsed = parseTelegramTarget(raw);
+  const chatId = normalizeOptionalString(parsed.chatId);
+  if (!chatId) {
+    return raw;
+  }
+  const resolvedThread = normalizeOptionalString(parsed.threadId) ?? normalizeOptionalString(threadId);
+  if (resolvedThread) {
+    return buildTelegramTopicConversationId(chatId, resolvedThread) || chatId;
+  }
+  return chatId;
+}
+
+function normalizeBluebubblesArchiveId(value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+  return raw.replace(/^bluebubbles:/i, "").trim();
+}
+
+function resolveArchiveConversationId(channelId, conversationId, metadata) {
+  const channel = String(channelId || "").toLowerCase();
+  if (channel === "telegram") {
+    return normalizeTelegramConversationId(
+      metadata?.to || metadata?.conversationId || conversationId || "",
+      metadata?.threadId,
+    );
+  }
+  if (channel === "bluebubbles" || channel === "imessage") {
+    return normalizeBluebubblesArchiveId(
+      conversationId || metadata?.conversationId || metadata?.to || metadata?.groupId || "",
+    );
+  }
+  return (
+    stripChannelPrefix(
+      conversationId || metadata?.conversationId || metadata?.to || metadata?.groupId || "",
+      channel,
+    ) || ""
+  );
+}
+
+function parseThreadSessionSuffix(sessionKey) {
+  const raw = normalizeOptionalString(sessionKey);
+  if (!raw) {
+    return { baseSessionKey: undefined, threadId: undefined };
+  }
+  const lowerRaw = raw.toLowerCase();
+  const threadMarker = ':thread:';
+  const threadIndex = lowerRaw.lastIndexOf(threadMarker);
+  const baseSessionKey = threadIndex === -1 ? raw : raw.slice(0, threadIndex);
+  const threadIdRaw = threadIndex === -1 ? undefined : raw.slice(threadIndex + threadMarker.length);
+  return {
+    baseSessionKey,
+    threadId: normalizeOptionalString(threadIdRaw),
+  };
+}
+
 function normalizeText(text) {
   return String(text || "")
     .replace(/\r\n/g, "\n")
@@ -309,12 +438,23 @@ export function isBluebubblesGroupLike(value) {
 
 export function buildBindingCandidates(channelId, conversationId, metadata) {
   const candidates = new Set();
+  const channel = String(channelId || "").toLowerCase();
   const push = (value) => {
     const raw = String(value || "").trim();
     if (!raw) {
       return;
     }
     candidates.add(raw);
+    const normalized = resolveArchiveConversationId(channelId, raw, metadata);
+    if (normalized) {
+      candidates.add(normalized);
+    }
+    if (channel === "telegram") {
+      const stripped = stripChannelPrefix(raw, channel);
+      if (stripped) {
+        candidates.add(stripped);
+      }
+    }
     const tgGroupId = extractTelegramGroupId(raw);
     if (tgGroupId) {
       candidates.add(tgGroupId);
@@ -326,7 +466,11 @@ export function buildBindingCandidates(channelId, conversationId, metadata) {
   push(metadata?.conversationId);
   push(metadata?.senderId);
   push(metadata?.threadId);
-  if (String(channelId || "").toLowerCase() === "telegram") {
+  const normalizedConversation = resolveArchiveConversationId(channelId, conversationId, metadata);
+  if (normalizedConversation) {
+    candidates.add(normalizedConversation);
+  }
+  if (channel === "telegram") {
     push(extractTelegramGroupId(conversationId, metadata?.to, metadata?.groupId));
   }
   return candidates;
@@ -407,19 +551,32 @@ export function deriveConversationLabel(channelId, conversationId, metadata, fal
   if (metadata?.guildId) {
     return `${metadata.guildId}:${metadata.channelName || "channel"}`;
   }
+  const normalizedConversation = resolveArchiveConversationId(channelId, conversationId, metadata);
+  if (normalizedConversation) {
+    return normalizedConversation;
+  }
   if (conversationId) {
     return String(conversationId);
   }
   return String(fallback || channelId || "conversation");
 }
 
-export function derivePeerId(chatType, conversationId, metadata, fallback) {
+export function derivePeerId(chatType, channelId, conversationId, metadata, fallback) {
   if (chatType === "group" || chatType === "channel") {
     const raw = String(conversationId || metadata?.to || metadata?.groupId || "");
     const match = raw.match(/-100\d+/);
     if (match) {
       return match[0];
     }
+  }
+  const normalizedChannelId = String(channelId || metadata?.channelId || metadata?.channel || "");
+  const normalizedConversation = resolveArchiveConversationId(
+    normalizedChannelId,
+    conversationId,
+    metadata,
+  );
+  if (normalizedConversation) {
+    return normalizedConversation;
   }
   return String(
     conversationId ||
@@ -973,7 +1130,7 @@ export function buildBaseEntry({
   const localDate = formatLocalDate(now);
   const localTime = formatLocalTime(now);
   const chatType = deriveChatType(channelId, conversationId, metadata, speakerName);
-  const peerId = derivePeerId(chatType, conversationId, metadata, speakerId);
+  const peerId = derivePeerId(chatType, channelId, conversationId, metadata, speakerId);
   const conversationLabel = deriveConversationLabel(channelId, conversationId, metadata, peerId);
   return {
     source,
@@ -1133,26 +1290,26 @@ export default function register(api) {
         warnUnsupportedChannel(channelId);
         return;
       }
+      const sessionThreadIn = parseThreadSessionSuffix(event?.sessionKey);
+      const inboundMetadata = {
+        to: context.to,
+        groupId: context.groupId,
+        isGroup: context.isGroup,
+        threadId: context.threadId ?? sessionThreadIn.threadId,
+        conversationId: context.conversationId,
+      };
       const workspaceInfo = resolveWorkspaceForInternalEvent(
         api.config,
         workspaceMap,
         event?.sessionKey,
         channelId,
         context.conversationId,
-        {
-          to: context.to,
-          groupId: context.groupId,
-          isGroup: context.isGroup,
-        },
+        inboundMetadata,
       );
       const entry = buildBaseEntry({
         channelId,
         conversationId: context.conversationId,
-        metadata: {
-          to: context.to,
-          groupId: context.groupId,
-          isGroup: context.isGroup,
-        },
+        metadata: inboundMetadata,
         source: "message-preprocessed",
         role: "user",
         speakerName: context.senderName || context.senderId || context.from,
@@ -1190,26 +1347,26 @@ export default function register(api) {
       if (context.success !== true) {
         return;
       }
+      const sessionThreadOut = parseThreadSessionSuffix(event?.sessionKey);
+      const outboundMetadata = {
+        to: context.to,
+        groupId: context.groupId,
+        isGroup: context.isGroup,
+        threadId: sessionThreadOut.threadId,
+        conversationId: context.conversationId,
+      };
       const workspaceInfo = resolveWorkspaceForInternalEvent(
         api.config,
         workspaceMap,
         event?.sessionKey,
         channelId,
         context.conversationId || context.to,
-        {
-          to: context.to,
-          groupId: context.groupId,
-          isGroup: context.isGroup,
-        },
+        outboundMetadata,
       );
       const entry = buildBaseEntry({
         channelId,
         conversationId: context.conversationId || context.to,
-        metadata: {
-          to: context.to,
-          groupId: context.groupId,
-          isGroup: context.isGroup,
-        },
+        metadata: outboundMetadata,
         source: "message-sent-internal",
         role: "assistant",
         speakerName: ASSISTANT_NAME,
