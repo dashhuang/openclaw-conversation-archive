@@ -3,6 +3,9 @@
   "name": "Conversation Archive",
   "description": "Archives gateway-seen messages into workspace-local JSONL logs and bundles a skill for later history retrieval.",
   "skills": ["./skills"],
+  "contracts": {
+    "tools": ["conversation_archive_search", "conversation_archive_health"]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
